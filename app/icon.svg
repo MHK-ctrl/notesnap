@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="NoteSnap">
+  <rect width="64" height="64" rx="14" fill="#4f46e5"/>
+  <path d="M16 20.5h20a4 4 0 0 1 4 4v19a4 4 0 0 1-4 4H16a4 4 0 0 1-4-4v-19a4 4 0 0 1 4-4z" fill="#ffffff"/>
+  <path d="M22 28h12M22 34h12M22 40h7" stroke="#4f46e5" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="46" cy="24" r="9" fill="#a5b4fc" stroke="#ffffff" stroke-width="3"/>
+</svg>
