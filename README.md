@@ -23,12 +23,16 @@ of a real snap → text run is the next upgrade here.</sub>
 > project**. Setup takes about five minutes — see
 > [Get a Vision API key](#get-a-google-cloud-vision-api-key-step-by-step).
 
-> ### 🔍 No public demo is hosted
+> ### 🔍 Live demo
 >
-> OCR costs money per image and is billed to whoever owns the key, so this
-> repository deliberately points at **no shared instance and no live URL**. Deploy
-> your own copy with the one-click button above, then add your key — about five
-> minutes, after which the URL is yours alone.
+> **<https://notesnap-theta.vercel.app>** — the UI, the camera input, the
+> browser-side resizing and every validation check run for real there.
+>
+> <sub>The hosted demo is provisioned **without** a Google Cloud key, so a real
+> upload answers with the "missing credentials" message instead of text — that is
+> the app refusing to fake a result rather than a broken button. Add your own key
+> to your own deployment (below) and transcription works end to end. OCR is billed
+> per image, which is why the shared demo doesn't carry the maintainer's key.</sub>
 
 ---
 
