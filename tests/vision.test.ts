@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ApiNotEnabledError,
+  BillingNotEnabledError,
   InvalidCredentialsError,
   MissingCredentialsError,
   NoTextDetectedError,
@@ -140,6 +142,45 @@ describe("transcribeImage", () => {
 
     await expect(transcribeImage(IMAGE, { apiKey: "k", fetchImpl })).rejects.toBeInstanceOf(
       InvalidCredentialsError,
+    );
+  });
+
+  it("maps a disabled API to ApiNotEnabledError", async () => {
+    const { fetchImpl } = stubFetch(() =>
+      jsonResponse(
+        {
+          error: {
+            code: 403,
+            message:
+              "Cloud Vision API has not been used in project 510607 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/vision.googleapis.com/overview?project=510607 then retry.",
+            status: "PERMISSION_DENIED",
+          },
+        },
+        403,
+      ),
+    );
+
+    await expect(transcribeImage(IMAGE, { apiKey: "k", fetchImpl })).rejects.toBeInstanceOf(
+      ApiNotEnabledError,
+    );
+  });
+
+  it("maps a project without billing to BillingNotEnabledError", async () => {
+    const { fetchImpl } = stubFetch(() =>
+      jsonResponse(
+        {
+          error: {
+            code: 403,
+            message:
+              "This API method requires billing to be enabled. Please enable billing on project #510607 by visiting https://console.developers.google.com/billing/enable?project=510607 then retry.",
+          },
+        },
+        403,
+      ),
+    );
+
+    await expect(transcribeImage(IMAGE, { apiKey: "k", fetchImpl })).rejects.toBeInstanceOf(
+      BillingNotEnabledError,
     );
   });
 

@@ -14,6 +14,8 @@ import { NextResponse } from "next/server";
 import { checkRateLimit, getClientKey, type RateLimitResult } from "@/lib/rate-limit";
 import { MAX_FILE_BYTES, validateImageFile } from "@/lib/validation";
 import {
+  ApiNotEnabledError,
+  BillingNotEnabledError,
   InvalidCredentialsError,
   MissingCredentialsError,
   NoTextDetectedError,
@@ -140,6 +142,24 @@ function mapError(error: unknown, headers: Record<string, string>): NextResponse
       500,
       "invalid_credentials",
       "Google Cloud Vision rejected the configured API key. Deployers: check that the key is valid and that the Cloud Vision API is enabled for its project.",
+      headers,
+    );
+  }
+
+  if (error instanceof ApiNotEnabledError) {
+    return errorResponse(
+      500,
+      "api_not_enabled",
+      "Google Cloud rejected the request because the Cloud Vision API isn't enabled on the project behind this API key. Deployers: enable it at https://console.cloud.google.com/apis/library/vision.googleapis.com (selecting the key's project), then try again.",
+      headers,
+    );
+  }
+
+  if (error instanceof BillingNotEnabledError) {
+    return errorResponse(
+      500,
+      "billing_not_enabled",
+      "Google Cloud rejected the request because the project behind this API key has no billing account enabled. Deployers: add billing to that project — Google requires it even though Vision's free monthly tier still applies.",
       headers,
     );
   }

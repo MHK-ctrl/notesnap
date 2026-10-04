@@ -11,6 +11,8 @@ import { POST } from "@/app/api/transcribe/route";
 import { DEFAULT_RATE_LIMIT, resetRateLimitStore } from "@/lib/rate-limit";
 import { MAX_FILE_BYTES } from "@/lib/validation";
 import {
+  ApiNotEnabledError,
+  BillingNotEnabledError,
   InvalidCredentialsError,
   MissingCredentialsError,
   NoTextDetectedError,
@@ -190,6 +192,28 @@ describe("POST /api/transcribe", () => {
 
     expect(response.status).toBe(500);
     expect((await readJson(response)).error?.code).toBe("invalid_credentials");
+  });
+
+  it("tells the deployer when the Vision API isn't enabled on their project", async () => {
+    mockedTranscribe.mockRejectedValue(new ApiNotEnabledError());
+
+    const response = await POST(makeRequest());
+
+    expect(response.status).toBe(500);
+    const payload = await readJson(response);
+    expect(payload.error?.code).toBe("api_not_enabled");
+    expect(payload.error?.message).toContain("vision.googleapis.com");
+  });
+
+  it("tells the deployer when the project has no billing account", async () => {
+    mockedTranscribe.mockRejectedValue(new BillingNotEnabledError());
+
+    const response = await POST(makeRequest());
+
+    expect(response.status).toBe(500);
+    const payload = await readJson(response);
+    expect(payload.error?.code).toBe("billing_not_enabled");
+    expect(payload.error?.message).toContain("billing");
   });
 
   it("returns 422 when the photo has no handwriting", async () => {

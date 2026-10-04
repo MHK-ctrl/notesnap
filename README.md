@@ -237,7 +237,9 @@ spikes before your card does.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `missing_credentials` on every request | `GOOGLE_VISION_API_KEY` isn't set where the app runs | Local: put it in `.env.local` and restart `npm run dev`. Vercel: add it under *Settings → Environment Variables* and **redeploy**. |
-| `invalid_credentials` | Key is wrong, deleted, or the Vision API isn't enabled on its project | Re-check the key, then confirm Cloud Vision shows **Enabled** for that project. |
+| `invalid_credentials` | Key is wrong, deleted, or restricted to another API | Re-check the key under *API restrictions*, then confirm Cloud Vision shows **Enabled** for its project. |
+| `api_not_enabled` | The Cloud Vision API isn't enabled on the project that owns the key | Open <https://console.cloud.google.com/apis/library/vision.googleapis.com> **with that project selected** and click **Enable**. |
+| `billing_not_enabled` | That project has no billing account linked | Add billing to it — Google requires a billing account even though the free monthly tier still applies. See [Cost & limits](#cost--limits). |
 | `403 PERMISSION_DENIED` in logs | Billing isn't enabled, or the key is restricted to a different API | Enable billing on the project; in the key's *API restrictions*, allow **Cloud Vision API**. |
 | `no_text` (422) | Vision found no handwriting | Fill the frame with the page, avoid glare and shadows, keep the phone parallel to the paper, use black ink on light paper. |
 | Photo looks squashed or unreadable after resizing | Very wide/tall source image | Retake it square-on; the app caps the longest edge at 2200px but never crops. |

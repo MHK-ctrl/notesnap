@@ -40,6 +40,22 @@ export class InvalidCredentialsError extends Error {
   }
 }
 
+/** The key is fine, but the project that owns it has the Cloud Vision API disabled. */
+export class ApiNotEnabledError extends Error {
+  constructor(message = "The Cloud Vision API is not enabled on this Google Cloud project") {
+    super(message);
+    this.name = "ApiNotEnabledError";
+  }
+}
+
+/** The key is fine, but the project that owns it has no billing account enabled. */
+export class BillingNotEnabledError extends Error {
+  constructor(message = "The Google Cloud project behind this key has no billing account enabled") {
+    super(message);
+    this.name = "BillingNotEnabledError";
+  }
+}
+
 /** Anything else that went wrong while talking to Vision. */
 export class VisionRequestError extends Error {
   readonly status: number;
@@ -148,8 +164,22 @@ export async function transcribeImage(
 }
 
 function mapHttpError(status: number, detail: string): Error {
+  if (/api key not valid|api_key_invalid/i.test(detail)) {
+    return new InvalidCredentialsError(detail || "Google Cloud Vision rejected the API key");
+  }
+
+  // A valid key on a project that isn't set up yet. These are the two most common
+  // deployment mistakes, so they get their own actionable errors instead of a
+  // generic upstream failure that reads like a Vision outage.
+  if (/billing/i.test(detail)) {
+    return new BillingNotEnabledError(detail || undefined);
+  }
+  if (/has not been used in project|service_disabled|it is disabled/i.test(detail)) {
+    return new ApiNotEnabledError(detail || undefined);
+  }
+
   if (status === 400 || status === 401 || status === 403) {
-    if (/api key not valid|api_key_invalid|permission denied|not authorized/i.test(detail)) {
+    if (/permission denied|not authorized/i.test(detail)) {
       return new InvalidCredentialsError(detail || "Google Cloud Vision rejected the API key");
     }
   }
