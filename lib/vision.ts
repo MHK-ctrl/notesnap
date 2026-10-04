@@ -37,6 +37,23 @@ function isRetryableUpstreamStatus(status: number): boolean {
   return RETRYABLE_UPSTREAM_STATUSES.has(status);
 }
 
+/**
+ * True when a provider error means the *daily quota* is gone rather than the
+ * request being throttled.
+ *
+ * Google distinguishes these in the message: quota exhaustion mentions quota or
+ * the `RESOURCE_EXHAUSTED`/`quota_exceeded` codes, while a momentary throttle
+ * says "rate limit". Only the first is a whole-day condition, and only the first
+ * should stop the app from calling the provider again until the next reset.
+ *
+ * When this can't be determined we return false on purpose. Treating an unknown
+ * 429 as exhausted would close the demo for the rest of the day on a transient
+ * error; treating an exhausted quota as transient just costs a few retries.
+ */
+function isQuotaExceededDetail(detail: string): boolean {
+  return /quota|resource_exhausted|exceeded your current quota|quota_exceeded/i.test(detail);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -90,6 +107,26 @@ export class BillingNotEnabledError extends Error {
 }
 
 /** Anything else that went wrong while talking to the provider. */
+/**
+ * The provider confirmed its per-project daily quota is spent.
+ *
+ * Distinct from a throttled 429 because this one lasts until the Pacific reset,
+ * not a second or two. The route records it in the shared store so later
+ * visitors are turned away immediately instead of each spending a request to
+ * rediscover the same wall.
+ */
+export class ProviderQuotaExceededError extends Error {
+  readonly provider: string;
+  readonly detail: string;
+
+  constructor(detail: string, provider = "gemini") {
+    super(detail || "The OCR provider's daily quota is exhausted.");
+    this.name = "ProviderQuotaExceededError";
+    this.provider = provider;
+    this.detail = detail;
+  }
+}
+
 /**
  * A provider failure that is worth retrying (Google shedding load, a transient
  * 5xx). The route turns this into a 503 with `Retry-After` so clients can back
@@ -304,8 +341,14 @@ async function requestWithRetry(
       // Quota exhausted, bad key, disabled API or missing billing: surface that
       // cause at once rather than retrying.
       if (response.status === 429) {
+        // A quota-exceeded 429 is permanent for the rest of the Pacific day, so
+        // it is distinguished from a throttled one: only the former should trip
+        // the shared circuit breaker.
+        if (isQuotaExceededDetail(detail)) {
+          throw new ProviderQuotaExceededError(detail, "gemini");
+        }
         throw new RetryableProviderError(
-          "The OCR provider has no quota left for this project right now.",
+          "The OCR provider is throttling this project; try again shortly.",
           429,
         );
       }

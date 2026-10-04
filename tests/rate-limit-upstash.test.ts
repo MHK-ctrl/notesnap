@@ -39,7 +39,16 @@ vi.mock("@upstash/redis", () => ({
   Redis: {
     fromEnv: () => {
       upstashMocks.fromEnv();
-      return { kind: "redis-client" };
+      // The shared quota store uses more of the client than the sliding-window
+      // limiter does, so the fake covers the whole surface this app touches.
+      return {
+        kind: "redis-client",
+        incr: async () => 1,
+        get: async () => null,
+        set: async () => "OK",
+        expire: async () => 1,
+        del: async () => 1,
+      };
     },
   },
 }));

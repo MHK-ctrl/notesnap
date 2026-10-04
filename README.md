@@ -203,10 +203,12 @@ vercel --prod
 | `GEMINI_API_KEY` | **Yes** | Free-tier Gemini key from Google AI Studio. Server-side only — never prefix it with `NEXT_PUBLIC_`. |
 | `GOOGLE_VISION_API_KEY` | **Yes** | Cloud Vision key. Wins over `GEMINI_API_KEY` when both are set. |
 | `GEMINI_MODEL` | No | Gemini model override, e.g. `gemini-3.5-flash-lite` (default: a current Flash model, `gemini-3.8-flash` at the time of writing). |
-| `UPSTASH_REDIS_REST_URL` | Recommended | Shared rate-limit store. Without it, limiting is per-instance only. |
+| `UPSTASH_REDIS_REST_URL` | Recommended | Shared rate-limit and demo-budget store. Without it, the public demo has no cross-instance counting. |
 | `UPSTASH_REDIS_REST_TOKEN` | Recommended | REST token paired with that URL. |
 | `RATE_LIMIT_MAX` | No | Requests allowed per client per window (default `10`). |
 | `RATE_LIMIT_WINDOW_MS` | No | Window length in milliseconds (default `60000`). |
+| `DEMO_DAILY_MAX` | No | Total demo transcriptions per Pacific day (default `100`). |
+| `PER_IP_DAILY_MAX` | No | Transcriptions one visitor may make per Pacific day (default `10`). |
 
 \* One OCR key is required — `GEMINI_API_KEY` (free) or `GOOGLE_VISION_API_KEY`.
 
@@ -216,6 +218,76 @@ vercel env add UPSTASH_REDIS_REST_URL production     # https://your-db.upstash.i
 vercel env add UPSTASH_REDIS_REST_TOKEN production   # paste the REST token when prompted
 vercel --prod                                        # env changes need a new deployment
 ```
+
+## The demo budget: why a public free-tier demo needs quotas
+
+A free Gemini key is per **project**, not per app or per key, and its daily limit
+resets at **midnight Pacific**. Note these are **per project and per model** —
+check your actual numbers at
+<https://ai.google.dev/gemini-api/docs/rate-limits> or in AI Studio under
+*Dashboard → Usage*.
+
+On a publicly reachable deployment that creates one specific failure: any
+visitor can spend the maintainer's whole daily budget, and after that every
+visitor gets an error until the reset. The app used to do exactly that — it would
+hand out requests until Google started refusing them.
+
+NoteSnap now meters the demo budget itself, in Upstash Redis so every serverless
+instance shares one set of counters:
+
+| Guard | Default | Scope |
+| --- | --- | --- |
+| Per-IP burst | 10 / 60s | demo **and** bring-your-own-key requests |
+| Per-IP daily | 10 per Pacific day | demo requests only |
+| Global daily | 100 per Pacific day | demo requests only |
+
+**Set `DEMO_DAILY_MAX` below your project's actual requests-per-day.** The point
+is for NoteSnap to stop serving requests *before* Google starts refusing them, so
+visitors see "the demo is done for today" instead of an error.
+
+**If Redis is unreachable the demo fails closed** with `503 demo_unavailable`.
+That is deliberate: quietly falling back to per-instance memory would let a
+Redis blip hand out unmetered requests and burn the project's quota invisibly.
+Point people at their own key instead. `GET /api/status` reports the same state
+the UI shows, with no secrets.
+
+### When the quota is genuinely gone
+
+Once the provider confirms the daily quota is spent, NoteSnap records a circuit
+breaker in Redis and stops calling it, so later visitors are turned away
+immediately instead of each spending a request to rediscover the same wall. The
+flag is keyed by provider, model and Pacific date, and expires at the reset.
+
+### Legitimate ways to add capacity
+
+- **Wait for the reset** — free, at midnight Pacific.
+- **Enable billing** — a paid Gemini tier, billed to you.
+- **Bring your own key** — the UI has a key field; your request spends *your*
+  quota and skips the demo budget entirely.
+- **Self-host** — your deployment, your quota, no shared counters.
+- **Cloud Vision** — a separate product with a separate quota
+  (~1,000 free images/month), but it requires Cloud Billing.
+
+> **Do not create extra Google projects or keys to evade a quota.** Google's APIs
+> Terms of Service prohibit circumventing documented rate and quota limits, so
+> farming quota across projects is not a workaround — it's a violation.
+
+## Bring your own key (works even when the demo is closed)
+
+The UI has an optional key field. When filled, that request is billed to **your**
+Gemini quota and skips the demo's daily budget and circuit breaker entirely — so
+a shared demo stays useful after its own quota is spent, without anyone creating
+extra Google projects to farm quota.
+
+> **Your key is sent to this app's server for this request only; it is not
+> stored.** It is held in memory for one request, never written to disk or
+> Redis, never logged (upstream error text is scrubbed of it), never saved to
+> localStorage or a cookie, and discarded when you clear the field or close the
+> tab. Self-host for full privacy.
+
+Bring-your-own-key requests still pass the light per-IP burst limit, which keeps
+the deployment from being used as an open proxy. For anything confidential,
+self-host instead, so the image never touches someone else's server.
 
 ## Shared rate limiting (Upstash Redis)
 
@@ -302,6 +374,9 @@ does.
 | HEIC photos from an iPhone fail | Your browser can't decode HEIC for compression, so the original is sent | Safari handles HEIC; if it still fails, set *Settings → Camera → Formats → Most Compatible*, or export as JPEG. |
 | Copy button says "Press Ctrl/Cmd + C" | Non-secure origin — the clipboard API is blocked | Serve over HTTPS (Vercel does this) or use `localhost`. |
 | `rate_limited` (429) | More than 10 transcriptions in a minute from one IP | Wait a minute, or raise `RATE_LIMIT_MAX`. |
+| `demo_budget_exhausted` (429) | The demo's shared daily budget is spent (per-IP or global) | Waits for midnight Pacific. Add your own key in the UI, self-host, or raise `DEMO_DAILY_MAX` **if** your provider limit allows it. |
+| `provider_quota_exhausted` (429) | Google's per-project daily quota for this key is spent | Wait for the Pacific reset, enable billing, or bring your own key. |
+| `demo_unavailable` (503) | The shared Upstash store is unreachable, so the demo can't track its budget | Check the Upstash database is active and both env vars are set for **Production**. The demo fails closed on purpose rather than serving unmetered requests. |
 | Quota errors (`429`, `ocr_failed`) | Gemini free-tier requests/day exhausted, or Cloud Vision rate limiting | Wait for the quota to reset (Gemini daily quotas reset at midnight US Pacific), raise your own limits, or upgrade the provider tier. |
 | `X-RateLimit-Mode: instance` in production | Upstash env vars are missing, so the limiter is per-instance only | Add `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` (see [Shared rate limiting](#shared-rate-limiting-upstash-redis)) and redeploy. |
 | Logs say "shared rate limiter unavailable" | Redis was unreachable; the route kept serving on the per-instance fallback | Check the Upstash database is active and the REST token is correct for **both** Production and Preview environments. |
@@ -320,9 +395,25 @@ npm test           # Vitest unit tests
 
 The suite covers the shared validation rules, the image-resize math, both rate
 limiter modes (the Upstash wiring is mocked, so no account is needed), the OCR
-wrapper (both providers, with an injected `fetch`) and the API route's happy and
-failure paths —
+wrapper (both providers, with an injected `fetch`), the daily-budget accounting
+(atomic caps, Pacific day keying, fail-closed behaviour), bring-your-own-key
+parsing and redaction, and the API routes' happy and failure paths —
 **no Google, Vercel or Upstash credentials required**.
+
+To check real recognition against a deployment, run the fixture script. It posts
+an image with known text and diffs the transcription line by line:
+
+```bash
+node scripts/ocr-fixture.mjs https://your-app.vercel.app \
+  --image /path/to/notes.png \
+  --expect "line one|line two"
+
+# Use your own quota instead of the demo's:
+X_NOTESNAP_USER_KEY=AIza... node scripts/ocr-fixture.mjs https://your-app.vercel.app
+```
+
+Exit code 0 means every expected line matched; 1 means a mismatch; 2 means the
+request itself failed.
 
 ## Project structure
 
@@ -337,6 +428,12 @@ lib/image.ts                    browser-side resize + re-encode
 lib/vision.ts                   OCR wrapper — Gemini + Cloud Vision (server-only)
 lib/validation.ts               file type + size checks (shared client/server)
 lib/rate-limit.ts               rate limiter: Upstash sliding window + per-instance fallback
+lib/demo-quota.ts               shared daily demo budget + quota circuit breaker
+lib/pacific-time.ts             Pacific day keys and reset times for daily quotas
+lib/user-key.ts                 bring-your-own-key header parsing + redaction
+app/api/status/route.ts         public demo budget/quota status (no secrets)
+components/DemoStatus.tsx       remaining-budget banner + BYOK key field
+scripts/ocr-fixture.mjs         posts a known image to a live deployment and diffs the result
 tests/                          Vitest unit tests
 ```
 

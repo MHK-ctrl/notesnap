@@ -12,7 +12,15 @@
 
 import { NextResponse } from "next/server";
 
+import {
+  consumeDemoBudget,
+  getSharedStore,
+  isQuotaBreakerSet,
+  setQuotaBreaker,
+} from "@/lib/demo-quota";
+import { nextPacificMidnight, secondsUntil } from "@/lib/pacific-time";
 import { checkRateLimit, getClientKey, type RateLimitResult } from "@/lib/rate-limit";
+import { readUserSuppliedKey, redactSecret } from "@/lib/user-key";
 import { MAX_FILE_BYTES, validateImageFile } from "@/lib/validation";
 import {
   ApiNotEnabledError,
@@ -20,6 +28,7 @@ import {
   InvalidCredentialsError,
   MissingCredentialsError,
   NoTextDetectedError,
+  ProviderQuotaExceededError,
   transcribeImage,
   VisionRequestError,
   RetryableProviderError,
@@ -32,6 +41,18 @@ export const maxDuration = 60;
 
 /** Form field that carries the image. */
 const IMAGE_FIELD = "image";
+
+/**
+ * Provider + model the shared circuit breaker is keyed by. Google's limits are
+ * per project *and* per model, so this pair identifies which budget is spent.
+ * Defaults mirror `lib/vision.ts`; the model is overridable for operators.
+ */
+const DEMO_PROVIDER = "gemini";
+const DEMO_MODEL = process.env.GEMINI_MODEL ?? "gemini-3.8-flash";
+
+/** Points visitors at the free key that keeps working when the demo is closed. */
+const BRING_YOUR_OWN_KEY_HINT =
+  "Get a free Gemini key at https://aistudio.google.com/app/apikey and paste it into the key field — your transcriptions then use your own quota.";
 
 /** Reject oversized bodies before parsing them (multipart adds a little overhead). */
 const MAX_REQUEST_BYTES = MAX_FILE_BYTES + 512 * 1024;
@@ -61,7 +82,30 @@ export async function POST(request: Request): Promise<NextResponse> {
 
   // Present on every answer after the limit check, so the limiter that handled
   // a request is observable even when the request itself fails.
+  // Present on every answer after the limit check, so the limiter that handled
+  // a request is observable even when the request itself fails.
   const rateHeaders = rateLimitHeaders(rateLimit);
+
+  // A visitor's own key spends their own provider quota, so it bypasses the demo
+  // budget and the circuit breaker entirely — but not the per-IP burst window,
+  // which still protects this deployment from being used as a free proxy.
+  const userKey = readUserSuppliedKey(request.headers);
+  const store = getSharedStore();
+
+  if (!userKey && store) {
+    const breaker = await isQuotaBreakerSet(store, DEMO_PROVIDER, DEMO_MODEL);
+    if (breaker) {
+      return quotaExhaustedResponse(rateHeaders);
+    }
+
+    const budget = await consumeDemoBudget(store, getClientKey(request.headers));
+    if (!budget.ok) {
+      return budgetResponse(budget, rateHeaders);
+    }
+    if (typeof budget.remaining === "number") {
+      rateHeaders["X-Demo-Remaining"] = String(budget.remaining);
+    }
+  }
 
   let form: FormData;
   try {
@@ -124,14 +168,74 @@ export async function POST(request: Request): Promise<NextResponse> {
     // Literal transcription only — no autocorrect, no rewriting. The declared
     // MIME type matters to Gemini's inline image data; the adapter sniffs the
     // bytes when the upload arrives without one.
-    const { text } = await transcribeImage(bytes, { mimeType: entry.type || undefined });
+    const { text } = await transcribeImage(bytes, {
+      mimeType: entry.type || undefined,
+      // The visitor's key is used for this call only and then falls out of scope.
+      apiKey: userKey ?? undefined,
+    });
     return NextResponse.json({ text }, { headers: { ...NO_STORE, ...rateHeaders } });
   } catch (error) {
-    return mapError(error, rateHeaders);
+    if (error instanceof ProviderQuotaExceededError && store && !userKey) {
+      // Remember it so the next visitor is turned away without spending a request
+      // to rediscover the same wall. The TTL expires at the Pacific reset.
+      await setQuotaBreaker(store, error.provider, DEMO_MODEL).catch((storeError) => {
+        console.error("[notesnap] could not record the provider quota state", storeError);
+      });
+      return quotaExhaustedResponse(rateHeaders);
+    }
+    return mapError(error, rateHeaders, userKey);
   }
 }
 
-function mapError(error: unknown, headers: Record<string, string>): NextResponse {
+/** 429 once the provider confirms its daily quota is spent for this project. */
+function quotaExhaustedResponse(headers: Record<string, string>): NextResponse {
+  const resetsAt = nextPacificMidnight();
+  return errorResponse(
+    429,
+    "provider_quota_exhausted",
+    `The demo's free OCR quota is used up for today and resets at midnight Pacific. ${BRING_YOUR_OWN_KEY_HINT}`,
+    headers,
+    { "Retry-After": String(secondsUntil(Date.now(), resetsAt)) },
+  );
+}
+
+/** 429 when the demo's own daily budget — per-IP or global — is spent. */
+function budgetResponse(
+  budget: { reason?: string; resetsAt?: number },
+  headers: Record<string, string>,
+): NextResponse {
+  if (budget.reason === "store_unavailable") {
+    // Fail closed: we cannot know today's spend, so we do not hand out an
+    // unmetered request and risk burning the project's quota invisibly.
+    return errorResponse(
+      503,
+      "demo_unavailable",
+      `The demo can't verify its remaining quota right now, so it isn't accepting requests. ${BRING_YOUR_OWN_KEY_HINT}`,
+      headers,
+      { "Retry-After": "30" },
+    );
+  }
+
+  const resetsAt = budget.resetsAt ?? nextPacificMidnight();
+  const which =
+    budget.reason === "global_daily"
+      ? "Everyone's demo quota is used up for today"
+      : "You've used today's demo allowance";
+
+  return errorResponse(
+    429,
+    "demo_budget_exhausted",
+    `${which}. It resets at midnight Pacific. ${BRING_YOUR_OWN_KEY_HINT}`,
+    headers,
+    { "Retry-After": String(secondsUntil(Date.now(), resetsAt)) },
+  );
+}
+
+function mapError(
+  error: unknown,
+  headers: Record<string, string>,
+  userKey: string | null = null,
+): NextResponse {
   if (error instanceof MissingCredentialsError) {
     return errorResponse(
       500,
@@ -198,9 +302,11 @@ function mapError(error: unknown, headers: Record<string, string>): NextResponse
   }
 
   if (error instanceof VisionRequestError) {
+    // Redacted because upstream error bodies can echo request details, and this
+    // message is written to logs.
     console.error("[notesnap] ocr request failed", {
       status: error.status,
-      message: error.message,
+      message: redactSecret(error.message, userKey),
     });
     return errorResponse(
       502,

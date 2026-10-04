@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import DemoStatusPanel from "@/components/DemoStatus";
 import PhotoUpload, { type PhotoPreview, type UploadStatus } from "@/components/PhotoUpload";
 import TranscriptEditor from "@/components/TranscriptEditor";
 import { prepareImageForUpload, releasePreviewUrl, type PreparedImage } from "@/lib/image";
@@ -10,10 +11,36 @@ import { formatBytes, validateImageFile } from "@/lib/validation";
 /** Update this if you fork the project under a different account. */
 const REPO_URL = "https://github.com/MHK-ctrl/notesnap";
 
+/** Header the visitor's own key travels in. Must match `lib/user-key.ts`. */
+const USER_KEY_HEADER = "x-notesnap-user-key";
+
 interface TranscribeResponse {
   text?: string;
   error?: { code?: string; message?: string };
 }
+
+/** Shape of `GET /api/status`. */
+interface DemoStatus {
+  demo: {
+    available: boolean;
+    used: number | null;
+    limit: number;
+    remaining: number | null;
+    resetsInSeconds: number;
+  };
+  quota: { exhausted: boolean };
+}
+
+const UNKNOWN_STATUS: DemoStatus = {
+  demo: {
+    available: true,
+    used: null,
+    limit: 0,
+    remaining: null,
+    resetsInSeconds: 0,
+  },
+  quota: { exhausted: false },
+};
 
 export default function HomePage() {
   const [status, setStatus] = useState<UploadStatus>("idle");
@@ -21,7 +48,31 @@ export default function HomePage() {
   const [transcript, setTranscript] = useState("");
   const [error, setError] = useState<string | null>(null);
 
+  const [demoStatus, setDemoStatus] = useState<DemoStatus>(UNKNOWN_STATUS);
+  // Held in memory for this tab only: never localStorage, never a cookie, never a
+  // query string. Closing the tab or clearing the field discards it.
+  const [userKey, setUserKey] = useState("");
+
   const previewUrlRef = useRef<string | null>(null);
+
+  /**
+   * Reads the demo's current budget so the panel can warn before an upload.
+   * Failure is non-fatal: the panel falls back to its neutral default rather
+   * than blocking the page, since the server still enforces every cap.
+   */
+  const refreshDemoStatus = useCallback(async () => {
+    try {
+      const response = await fetch("/api/status", { cache: "no-store" });
+      if (!response.ok) return;
+      setDemoStatus((await response.json()) as DemoStatus);
+    } catch {
+      // Offline or the endpoint is unavailable: keep the last known state.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshDemoStatus();
+  }, [refreshDemoStatus]);
 
   // Never leak blob URLs when the tab unmounts.
   useEffect(() => {
@@ -35,8 +86,14 @@ export default function HomePage() {
     const body = new FormData();
     body.append("image", file, file.name);
 
+    const headers: Record<string, string> = {};
+    const trimmedKey = userKey.trim();
+    if (trimmedKey) headers[USER_KEY_HEADER] = trimmedKey;
+
     try {
-      const response = await fetch("/api/transcribe", { method: "POST", body });
+      const response = await fetch("/api/transcribe", { method: "POST", body, headers });
+      // The budget moved, so refresh what the panel shows.
+      void refreshDemoStatus();
       const payload = (await response.json().catch(() => null)) as TranscribeResponse | null;
 
       if (!response.ok) {
@@ -58,7 +115,7 @@ export default function HomePage() {
       setError("We couldn't reach the transcription service. Check your connection and try again.");
       setStatus("ready");
     }
-  }, []);
+  }, [userKey, refreshDemoStatus]);
 
   const handleSelect = useCallback(
     async (candidate: File) => {
@@ -152,6 +209,16 @@ export default function HomePage() {
           onClear={handleStartOver}
         />
       </section>
+
+      <DemoStatusPanel
+        remaining={demoStatus.demo.remaining}
+        limit={demoStatus.demo.limit}
+        available={demoStatus.demo.available}
+        quotaExhausted={demoStatus.quota.exhausted}
+        resetsInSeconds={demoStatus.demo.resetsInSeconds}
+        userKey={userKey}
+        onUserKeyChange={setUserKey}
+      />
 
       <p role="status" aria-live="polite" className="min-h-6 text-sm text-slate-600">
         {statusMessage}
