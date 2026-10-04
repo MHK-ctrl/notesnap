@@ -10,11 +10,15 @@
 
 ![NoteSnap result screen](docs/screenshot-result-stubbed.png)
 
-<sub>Both images are real captures of this app at a 390px mobile viewport. The first is
-the upload screen. The second shows the result screen with a **stubbed transcription** —
-the OCR response was mocked so the capture could be taken without an OCR key — and
-it carries a visible label saying so. Read it as a UI sample, not as an OCR result; a GIF
-of a real snap → text run is the next upgrade here.</sub>
+![NoteSnap demo-quota banner](docs/screenshot-quota-state.png)
+
+<sub>All three are real captures of this app at a 390px mobile viewport. The first is the
+upload screen. The second shows the result screen with a **stubbed transcription** — the
+OCR response was mocked so the capture could be taken without an OCR key — and it carries
+a visible label saying so. The third is a live capture of the deployed demo showing the
+**quota banner** while Google's provider was throttling: the app reporting a busy
+provider with the wait it was given, rather than a dead end. Read the second as a UI
+sample, not as an OCR result.</sub>
 
 > ### 🔑 Each deployer brings their own OCR key
 >
@@ -333,6 +337,13 @@ extra Google projects to farm quota.
 > Redis, never logged (upstream error text is scrubbed of it), never saved to
 > localStorage or a cookie, and discarded when you clear the field or close the
 > tab. Self-host for full privacy.
+
+**Being precise about that:** a bring-your-own-key request is not peer-to-peer —
+your photo and your key both transit the server running this deployment before
+reaching Google. The key is memory-only and never persisted, but "self-host for
+full privacy" is the real answer if that transit matters. Note also that on
+Google's free tier, submitted content may be used to improve Google's products,
+which `store: false` does not change — see [Privacy](#privacy).
 
 Bring-your-own-key requests still pass the light per-IP burst limit, which keeps
 the deployment from being used as an open proxy. For anything confidential,
