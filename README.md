@@ -30,12 +30,12 @@ of a real snap → text run is the next upgrade here.</sub>
 > **<https://notesnap-theta.vercel.app>** — the UI, the camera input, the
 > browser-side resizing and every validation check run for real there.
 >
-> <sub>The hosted demo is provisioned **without an OCR key**, so a real
-> upload answers with the "missing credentials" message instead of text — that is
-> the app refusing to fake a result rather than a broken button. Add your own key
-> to your own deployment (below) and transcription works end to end. OCR quota is
-> counted against whoever owns the key, which is why the shared demo does not
-> carry the maintainer's key.</sub>
+> <sub>The hosted demo runs a real Gemini key on the free tier, so uploads
+> transcribe for real. Two honest caveats: quota is shared by everyone who uses
+> the link, so it is capped at 10 requests/minute per IP and can hit Gemini's
+> per-project daily limit; and on the free tier Google may use submitted images
+> to improve its products — don't scan anything sensitive here. Use your own
+> deployment (below) with your own key for anything private.</sub>
 
 ---
 
