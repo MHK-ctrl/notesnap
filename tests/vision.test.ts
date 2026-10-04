@@ -6,6 +6,7 @@ import {
   InvalidCredentialsError,
   MissingCredentialsError,
   NoTextDetectedError,
+  RetryableProviderError,
   VisionRequestError,
   transcribeImage,
 } from "@/lib/vision";
@@ -580,7 +581,7 @@ describe("transcribeImage — Gemini provider", () => {
     ).rejects.toBeInstanceOf(ApiNotEnabledError);
   });
 
-  it("maps upstream rate limiting to a VisionRequestError with status 429", async () => {
+  it("maps upstream rate limiting to a RetryableProviderError with status 429", async () => {
     const { fetchImpl } = stubFetch(() =>
       jsonResponse({ error: { code: 429, message: "Quota exceeded." } }, 429),
     );
@@ -588,8 +589,52 @@ describe("transcribeImage — Gemini provider", () => {
     const error = await transcribeImage(IMAGE, { provider: "gemini", apiKey: "k", fetchImpl }).catch(
       (e: unknown) => e,
     );
-    expect(error).toBeInstanceOf(VisionRequestError);
-    expect((error as VisionRequestError).status).toBe(429);
+    expect(error).toBeInstanceOf(RetryableProviderError);
+    expect((error as RetryableProviderError).status).toBe(429);
+  });
+
+  it("does not retry a 429 — the quota is spent, not shedding load", async () => {
+    const { fetchImpl, calls } = stubFetch(() =>
+      jsonResponse({ error: { code: 429, message: "Quota exceeded." } }, 429),
+    );
+
+    await expect(
+      transcribeImage(IMAGE, { provider: "gemini", apiKey: "k", fetchImpl }),
+    ).rejects.toBeInstanceOf(RetryableProviderError);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("retries a 503 and succeeds when the provider recovers", async () => {
+    const { fetchImpl, calls } = stubFetch((_url, init) => {
+      const attempt = calls.length; // stubFetch records before calling the handler
+      void init;
+      if (attempt < 3) {
+        return jsonResponse({ error: { code: 503, message: "high demand" } }, 503);
+      }
+      return geminiReply("recovered");
+    });
+
+    const result = await transcribeImage(IMAGE, {
+      provider: "gemini",
+      apiKey: "k",
+      fetchImpl,
+    });
+
+    expect(result.text).toBe("recovered");
+    expect(calls.length).toBeGreaterThan(1);
+  });
+
+  it("gives up on a persistent 503 with a retryable error", async () => {
+    const { fetchImpl, calls } = stubFetch(() =>
+      jsonResponse({ error: { code: 503, message: "high demand" } }, 503),
+    );
+
+    const error = await transcribeImage(IMAGE, { provider: "gemini", apiKey: "k", fetchImpl }).catch(
+      (e: unknown) => e,
+    );
+
+    expect(error).toBeInstanceOf(RetryableProviderError);
+    expect(calls).toHaveLength(3);
   });
 
   it("wraps network failures with status 0", async () => {
@@ -608,9 +653,11 @@ describe("transcribeImage — Gemini provider", () => {
   it("handles a non-JSON error body without crashing", async () => {
     const { fetchImpl } = stubFetch(() => new Response("<html>gateway</html>", { status: 502 }));
 
+    // 502 is retryable, so it exhausts the attempts and reports as retryable
+    // rather than crashing on the unparseable body.
     await expect(
       transcribeImage(IMAGE, { provider: "gemini", apiKey: "k", fetchImpl }),
-    ).rejects.toBeInstanceOf(VisionRequestError);
+    ).rejects.toBeInstanceOf(RetryableProviderError);
   });
 
   it("mentions the requested languages in the prompt when hinted", async () => {

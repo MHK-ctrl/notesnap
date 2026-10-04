@@ -16,6 +16,7 @@ import {
   InvalidCredentialsError,
   MissingCredentialsError,
   NoTextDetectedError,
+  RetryableProviderError,
   VisionRequestError,
   transcribeImage,
 } from "@/lib/vision";
@@ -231,12 +232,34 @@ describe("POST /api/transcribe", () => {
   });
 
   it("returns 502 when Vision fails", async () => {
-    mockedTranscribe.mockRejectedValue(new VisionRequestError("boom", 503));
+    mockedTranscribe.mockRejectedValue(new VisionRequestError("boom", 502));
 
     const response = await POST(makeRequest());
 
     expect(response.status).toBe(502);
     expect((await readJson(response)).error?.code).toBe("ocr_failed");
+  });
+
+  it("returns 503 with Retry-After when the provider is only temporarily busy", async () => {
+    mockedTranscribe.mockRejectedValue(new RetryableProviderError("high demand", 503));
+
+    const response = await POST(makeRequest());
+    const body = await readJson(response);
+
+    expect(response.status).toBe(503);
+    expect(body.error?.code).toBe("provider_busy");
+    expect(response.headers.get("Retry-After")).toBe("5");
+  });
+
+  it("returns 429 with Retry-After when the provider's quota is spent", async () => {
+    mockedTranscribe.mockRejectedValue(new RetryableProviderError("quota exceeded", 429));
+
+    const response = await POST(makeRequest());
+    const body = await readJson(response);
+
+    expect(response.status).toBe(429);
+    expect(body.error?.code).toBe("provider_busy");
+    expect(response.headers.get("Retry-After")).toBe("5");
   });
 
   it("returns 500 for unexpected errors without leaking details", async () => {

@@ -22,6 +22,7 @@ import {
   NoTextDetectedError,
   transcribeImage,
   VisionRequestError,
+  RetryableProviderError,
 } from "@/lib/vision";
 
 // Buffer/File handling and env access need the Node runtime, not Edge.
@@ -176,6 +177,26 @@ function mapError(error: unknown, headers: Record<string, string>): NextResponse
     );
   }
 
+  if (error instanceof RetryableProviderError) {
+    // The provider is shedding load (Google's "high demand" 503s) or the
+    // project's free-tier quota is spent. Either way the request is fine — it
+    // just can't be served right now — so report that, not a broken server.
+    console.warn("[notesnap] ocr provider unavailable, giving up", {
+      status: error.status,
+      message: error.message,
+    });
+    const isQuota = error.status === 429;
+    return errorResponse(
+      isQuota ? 429 : 503,
+      "provider_busy",
+      isQuota
+        ? "The free OCR quota for this deployment is used up for today. Try again after it resets, or bring your own key."
+        : "The transcription service is busy right now. Wait a few seconds and try again — your photo wasn't the problem.",
+      headers,
+      { "Retry-After": String(RETRY_AFTER_SECONDS) },
+    );
+  }
+
   if (error instanceof VisionRequestError) {
     console.error("[notesnap] ocr request failed", {
       status: error.status,
@@ -200,6 +221,9 @@ function mapError(error: unknown, headers: Record<string, string>): NextResponse
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
 
+/** How long to tell clients to wait after a temporary provider failure. */
+const RETRY_AFTER_SECONDS = 5;
+
 /**
  * Exposes which limiter answered (`shared` = Upstash Redis, `instance` = this
  * process's memory) so a deployment's real protection is observable rather
@@ -218,8 +242,12 @@ function errorResponse(
   code: string,
   message: string,
   headers: Record<string, string> = {},
+  extraHeaders: Record<string, string> = {},
 ): NextResponse {
-  return NextResponse.json({ error: { code, message } }, { status, headers: { ...headers, ...NO_STORE } });
+  return NextResponse.json(
+    { error: { code, message } },
+    { status, headers: { ...headers, ...extraHeaders, ...NO_STORE } },
+  );
 }
 
 /** Structural check so the route works with any `File`-like implementation. */

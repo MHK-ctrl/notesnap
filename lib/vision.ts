@@ -20,6 +20,27 @@ import "server-only";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
+/**
+ * Transient upstream failures (Gemini's "high demand" 503s, timeouts, 5xx) are
+ * retried a couple of times before we surface them. Google's free tier sheds
+ * load this way regularly, and a retry usually succeeds within a second or two.
+ *
+ * 429 is deliberately excluded: on the free tier it means the daily quota is
+ * spent, and retrying immediately would only burn time. It is still reported as
+ * retryable so the route answers 429 + `Retry-After` rather than a vague 502.
+ */
+const RETRYABLE_UPSTREAM_STATUSES = new Set([408, 425, 500, 502, 503, 504]);
+const MAX_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 400;
+
+function isRetryableUpstreamStatus(status: number): boolean {
+  return RETRYABLE_UPSTREAM_STATUSES.has(status);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const VISION_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate";
 
 /**
@@ -69,6 +90,21 @@ export class BillingNotEnabledError extends Error {
 }
 
 /** Anything else that went wrong while talking to the provider. */
+/**
+ * A provider failure that is worth retrying (Google shedding load, a transient
+ * 5xx). The route turns this into a 503 with `Retry-After` so clients can back
+ * off, instead of the opaque 502 that made a temporary spike look like a bug.
+ */
+export class RetryableProviderError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status = 503) {
+    super(message);
+    this.name = "RetryableProviderError";
+    this.status = status;
+  }
+}
+
 export class VisionRequestError extends Error {
   readonly status: number;
 
@@ -197,24 +233,14 @@ async function transcribeWithGemini(
     ],
   });
 
-  let response: Response;
-  try {
-    response = await fetchImpl(GEMINI_ENDPOINT, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
-      body,
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "network error";
-    throw new VisionRequestError(`Could not reach the Gemini API: ${reason}`, 0);
-  }
-
-  const rawText = await response.text();
+  const rawText = await requestWithRetry(fetchImpl, body, apiKey);
   const payload = safeJson<InteractionResponse>(rawText);
 
-  if (!response.ok) {
-    throw mapUpstreamError(response.status, extractErrorMessage(payload) ?? rawText);
+  if (payload === undefined) {
+    throw new VisionRequestError(
+      "The OCR provider sent a response we could not read.",
+      502,
+    );
   }
 
   const text = stripCodeFence(extractInteractionText(payload)).trim();
@@ -224,6 +250,79 @@ async function transcribeWithGemini(
   }
 
   return { text };
+}
+
+/**
+ * POSTs one interaction to Gemini, retrying transient load-shedding responses.
+ *
+ * Returns the raw response body on success. Non-retryable failures (bad key,
+ * disabled API, billing) are mapped immediately by `mapUpstreamError` so the
+ * route can still report the actionable cause. Once the attempts are exhausted
+ * a still-retryable failure becomes a `RetryableProviderError`, which the route
+ * answers with 503 + `Retry-After`.
+ */
+async function requestWithRetry(
+  fetchImpl: typeof fetch,
+  body: string,
+  apiKey: string,
+): Promise<string> {
+  let lastDetail = "";
+  let lastStatus = 503;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    let response: Response;
+    try {
+      response = await fetchImpl(GEMINI_ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+        body,
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "network error";
+      // A timeout or dropped connection is transient too, but only retry while
+      // attempts remain; otherwise report it as an upstream failure.
+      if (attempt < MAX_ATTEMPTS) {
+        await sleep(RETRY_BASE_DELAY_MS * attempt);
+        continue;
+      }
+      throw new VisionRequestError(`Could not reach the Gemini API: ${reason}`, 0);
+    }
+
+    const rawText = await response.text();
+
+    if (response.ok) {
+      return rawText;
+    }
+
+    const payload = safeJson<InteractionResponse>(rawText);
+    const detail = extractErrorMessage(payload) ?? rawText;
+    lastDetail = detail;
+    lastStatus = response.status;
+
+    if (!isRetryableUpstreamStatus(response.status)) {
+      // Quota exhausted, bad key, disabled API or missing billing: surface that
+      // cause at once rather than retrying.
+      if (response.status === 429) {
+        throw new RetryableProviderError(
+          "The OCR provider has no quota left for this project right now.",
+          429,
+        );
+      }
+      throw mapUpstreamError(response.status, detail);
+    }
+
+    if (attempt === MAX_ATTEMPTS) {
+      break;
+    }
+
+    await sleep(RETRY_BASE_DELAY_MS * attempt);
+  }
+
+  throw new RetryableProviderError(
+    lastDetail || `The OCR provider returned HTTP ${lastStatus}.`,
+    lastStatus,
+  );
 }
 
 /**
