@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// The route imports the Vision wrapper; swap in a mock and keep the real error
+// The route imports the OCR wrapper; swap in a mock and keep the real error
 // classes so the route's error mapping is exercised for real.
 vi.mock("@/lib/vision", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/vision")>();
@@ -89,16 +89,17 @@ describe("POST /api/transcribe", () => {
     expect(Number(response.headers.get("x-ratelimit-remaining"))).toBeGreaterThanOrEqual(0);
   });
 
-  it("passes the raw image bytes to Vision", async () => {
+  it("passes the raw image bytes and declared MIME type to the OCR wrapper", async () => {
     mockedTranscribe.mockResolvedValue({ text: "ok" });
     const bytes = new Uint8Array([9, 8, 7, 6]);
 
     await POST(makeRequest({ file: imageFile("page.png", "image/png", bytes) }));
 
     expect(mockedTranscribe).toHaveBeenCalledTimes(1);
-    const [received] = mockedTranscribe.mock.calls[0] ?? [];
+    const [received, options] = mockedTranscribe.mock.calls[0] ?? [];
     expect(received).toBeInstanceOf(Uint8Array);
     expect(Array.from(received ?? [])).toEqual([9, 8, 7, 6]);
+    expect(options?.mimeType).toBe("image/png");
   });
 
   it("returns literal text without rewriting it", async () => {
@@ -172,7 +173,7 @@ describe("POST /api/transcribe", () => {
     expect((await readJson(response)).error?.code).toBe("invalid_request");
   });
 
-  it("explains how to fix a deployment with no Vision key", async () => {
+  it("explains how to fix a deployment with no OCR key, naming both providers", async () => {
     mockedTranscribe.mockRejectedValue(new MissingCredentialsError());
 
     const response = await POST(makeRequest());
@@ -180,6 +181,7 @@ describe("POST /api/transcribe", () => {
     expect(response.status).toBe(500);
     const payload = await readJson(response);
     expect(payload.error?.code).toBe("missing_credentials");
+    expect(payload.error?.message).toContain("GEMINI_API_KEY");
     expect(payload.error?.message).toContain("GOOGLE_VISION_API_KEY");
     // Failures still report which limiter handled the request.
     expect(response.headers.get("x-ratelimit-mode")).toBe("instance");
@@ -194,7 +196,7 @@ describe("POST /api/transcribe", () => {
     expect((await readJson(response)).error?.code).toBe("invalid_credentials");
   });
 
-  it("tells the deployer when the Vision API isn't enabled on their project", async () => {
+  it("tells the deployer when the OCR API isn't enabled on their project", async () => {
     mockedTranscribe.mockRejectedValue(new ApiNotEnabledError());
 
     const response = await POST(makeRequest());
@@ -203,6 +205,7 @@ describe("POST /api/transcribe", () => {
     const payload = await readJson(response);
     expect(payload.error?.code).toBe("api_not_enabled");
     expect(payload.error?.message).toContain("vision.googleapis.com");
+    expect(payload.error?.message).toContain("Generative Language API");
   });
 
   it("tells the deployer when the project has no billing account", async () => {

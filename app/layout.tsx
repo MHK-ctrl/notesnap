@@ -5,9 +5,9 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "NoteSnap — handwritten notes to text",
   description:
-    "Snap a photo of handwritten notes and get clean, editable, paste-ready text in seconds. Open source, MIT licensed, bring your own Google Cloud Vision key.",
+    "Snap a photo of handwritten notes and get clean, editable, paste-ready text in seconds. Open source, MIT licensed, bring your own key — a free Gemini API key from Google AI Studio, or Google Cloud Vision.",
   applicationName: "NoteSnap",
-  keywords: ["handwriting OCR", "notes to text", "Google Cloud Vision", "open source"],
+  keywords: ["handwriting OCR", "notes to text", "Gemini API", "Google Cloud Vision", "open source"],
   openGraph: {
     title: "NoteSnap — handwritten notes to text",
     description:

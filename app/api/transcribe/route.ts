@@ -1,9 +1,10 @@
 /**
- * POST /api/transcribe — the only place the app touches Google Cloud Vision.
+ * POST /api/transcribe — the app's only OCR endpoint.
  *
  * The image arrives as multipart/form-data, is validated again here (the client
- * checks are for UX, not security), and is forwarded to Vision in memory. Nothing
- * is written to disk, cached or logged: process, respond, forget.
+ * checks are for UX, not security), and is forwarded in memory to the OCR
+ * provider chosen in `lib/vision.ts` (Gemini free tier or Cloud Vision).
+ * Nothing is written to disk, cached or logged: process, respond, forget.
  *
  * The API key is read from `process.env` inside `lib/vision.ts` and never leaves
  * the server. This file must stay a server module.
@@ -119,8 +120,10 @@ export async function POST(request: Request): Promise<NextResponse> {
   }
 
   try {
-    // Literal transcription only — no autocorrect, no rewriting.
-    const { text } = await transcribeImage(bytes);
+    // Literal transcription only — no autocorrect, no rewriting. The declared
+    // MIME type matters to Gemini's inline image data; the adapter sniffs the
+    // bytes when the upload arrives without one.
+    const { text } = await transcribeImage(bytes, { mimeType: entry.type || undefined });
     return NextResponse.json({ text }, { headers: { ...NO_STORE, ...rateHeaders } });
   } catch (error) {
     return mapError(error, rateHeaders);
@@ -132,7 +135,7 @@ function mapError(error: unknown, headers: Record<string, string>): NextResponse
     return errorResponse(
       500,
       "missing_credentials",
-      "This NoteSnap instance has no Google Cloud Vision key configured. Deployers: set GOOGLE_VISION_API_KEY in your environment and redeploy.",
+      "This NoteSnap instance has no OCR key configured. Deployers: set GEMINI_API_KEY (Google AI Studio — free, no credit card) or GOOGLE_VISION_API_KEY (Cloud Vision) in your environment, then redeploy.",
       headers,
     );
   }
@@ -141,7 +144,7 @@ function mapError(error: unknown, headers: Record<string, string>): NextResponse
     return errorResponse(
       500,
       "invalid_credentials",
-      "Google Cloud Vision rejected the configured API key. Deployers: check that the key is valid and that the Cloud Vision API is enabled for its project.",
+      "The OCR provider rejected the configured API key. Deployers: check that the key is valid — and, for Cloud Vision, that the Cloud Vision API is enabled on the key's project.",
       headers,
     );
   }
@@ -150,7 +153,7 @@ function mapError(error: unknown, headers: Record<string, string>): NextResponse
     return errorResponse(
       500,
       "api_not_enabled",
-      "Google Cloud rejected the request because the Cloud Vision API isn't enabled on the project behind this API key. Deployers: enable it at https://console.cloud.google.com/apis/library/vision.googleapis.com (selecting the key's project), then try again.",
+      "Google rejected the request because the OCR API isn't enabled on the project behind this API key. Cloud Vision: enable it at https://console.cloud.google.com/apis/library/vision.googleapis.com with the key's project selected. Gemini: enable the Generative Language API on that project, or create a fresh AI Studio key.",
       headers,
     );
   }
@@ -159,7 +162,7 @@ function mapError(error: unknown, headers: Record<string, string>): NextResponse
     return errorResponse(
       500,
       "billing_not_enabled",
-      "Google Cloud rejected the request because the project behind this API key has no billing account enabled. Deployers: add billing to that project — Google requires it even though Vision's free monthly tier still applies.",
+      "Google rejected the request because the project behind this API key has a billing problem. Cloud Vision needs a billing account even though it has a free monthly tier; the Gemini free tier does not — switching to GEMINI_API_KEY may be the fastest fix.",
       headers,
     );
   }
@@ -174,7 +177,7 @@ function mapError(error: unknown, headers: Record<string, string>): NextResponse
   }
 
   if (error instanceof VisionRequestError) {
-    console.error("[notesnap] vision request failed", {
+    console.error("[notesnap] ocr request failed", {
       status: error.status,
       message: error.message,
     });

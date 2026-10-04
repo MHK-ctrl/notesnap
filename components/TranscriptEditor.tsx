@@ -15,7 +15,7 @@ type CopyState = "idle" | "copied" | "manual";
 /**
  * Editable transcription result.
  *
- * The textarea is deliberately plain: what Vision read is what you see, so OCR
+ * The textarea is deliberately plain: what the OCR engine read is what you see, so OCR
  * mistakes stay visible and fixable instead of being silently "corrected".
  */
 export default function TranscriptEditor({

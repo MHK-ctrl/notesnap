@@ -196,8 +196,8 @@ export default function HomePage() {
 
       <footer className="mt-auto space-y-2 border-t border-slate-200 pt-4 text-xs text-slate-500">
         <p>
-          Privacy: your photo is sent to Google Cloud Vision for OCR and is never stored by this
-          app — no database, no bucket, no logs of your images.
+          Privacy: your photo is sent to our OCR provider (Google) for processing and is never
+          stored by this app — no database, no bucket, no logs of your images.
         </p>
         <p>
           Open source (MIT) ·{" "}
@@ -207,7 +207,7 @@ export default function HomePage() {
           >
             Fork it on GitHub
           </a>{" "}
-          — each deployer brings their own Google Cloud credentials.
+          — each deployer brings their own OCR API key.
         </p>
       </footer>
     </main>

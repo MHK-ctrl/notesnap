@@ -1,22 +1,26 @@
 /**
- * Google Cloud Vision wrapper — server-only.
+ * OCR wrapper — server-only. Speaks to one of two Google providers:
+ *
+ * - Gemini API (Google AI Studio) — the recommended default: a free tier that
+ *   needs no credit card, and strong handwriting recognition. Auth: `GEMINI_API_KEY`.
+ * - Google Cloud Vision — the original provider. Auth: `GOOGLE_VISION_API_KEY`.
+ *   Vision has a free monthly tier, but Google requires a Cloud Billing
+ *   account on the project, so it is the heavier setup of the two.
  *
  * `import "server-only"` makes the build fail loudly if any client component
- * ever imports this file, which keeps the API key on the server.
+ * ever imports this file, which keeps the API keys on the server.
  *
- * This module is intentionally the only place that knows about Vision's wire
- * format. To swap in a different OCR engine later, reimplement
- * `transcribeImage` in terms of the same return shape.
- *
- * Auth: a Google Cloud API key (`GOOGLE_VISION_API_KEY`). Vision's REST API
- * accepts `?key=`, so no SDK or OAuth flow is needed. Prefer a service account
- * with a restricted IAM role for production — see README "Production notes".
+ * This module is intentionally the only place that knows either provider's wire
+ * format. The provider is chosen from the environment — Cloud Vision wins when
+ * both keys are set, so existing deployments keep behaving exactly as before —
+ * or forced per call with `options.provider`.
  */
 
 import "server-only";
 
-const VISION_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate";
 const REQUEST_TIMEOUT_MS = 30_000;
+
+const VISION_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate";
 
 /**
  * DOCUMENT_TEXT_DETECTION is Vision's dense/handwriting-oriented OCR mode: it
@@ -24,39 +28,47 @@ const REQUEST_TIMEOUT_MS = 30_000;
  */
 const DOCUMENT_TEXT_DETECTION = "DOCUMENT_TEXT_DETECTION" as const;
 
-/** No `GOOGLE_VISION_API_KEY` in the environment. */
+const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions";
+
+/** Current Flash model at the time of writing; override with `GEMINI_MODEL`. */
+const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
+
+/** Reply the model is told to give when the photo holds no readable text. */
+const NO_TEXT_SENTINEL = "NO_TEXT_DETECTED";
+
+/** No API key is configured for the selected OCR provider. */
 export class MissingCredentialsError extends Error {
-  constructor(message = "GOOGLE_VISION_API_KEY is not set") {
+  constructor(message = "No OCR API key is set") {
     super(message);
     this.name = "MissingCredentialsError";
   }
 }
 
-/** Google rejected the key (disabled API, wrong project, revoked key). */
+/** The provider rejected the key (revoked key, wrong project, disabled API). */
 export class InvalidCredentialsError extends Error {
-  constructor(message = "Google Cloud Vision rejected the API key") {
+  constructor(message = "The OCR provider rejected the API key") {
     super(message);
     this.name = "InvalidCredentialsError";
   }
 }
 
-/** The key is fine, but the project that owns it has the Cloud Vision API disabled. */
+/** The key is fine, but its project has the OCR API disabled. */
 export class ApiNotEnabledError extends Error {
-  constructor(message = "The Cloud Vision API is not enabled on this Google Cloud project") {
+  constructor(message = "The OCR API is not enabled on this key's project") {
     super(message);
     this.name = "ApiNotEnabledError";
   }
 }
 
-/** The key is fine, but the project that owns it has no billing account enabled. */
+/** The key is fine, but its project has a billing problem. */
 export class BillingNotEnabledError extends Error {
-  constructor(message = "The Google Cloud project behind this key has no billing account enabled") {
+  constructor(message = "The project behind this API key has a billing problem") {
     super(message);
     this.name = "BillingNotEnabledError";
   }
 }
 
-/** Anything else that went wrong while talking to Vision. */
+/** Anything else that went wrong while talking to the provider. */
 export class VisionRequestError extends Error {
   readonly status: number;
 
@@ -67,7 +79,7 @@ export class VisionRequestError extends Error {
   }
 }
 
-/** Vision answered, but found no text at all. */
+/** The provider answered, but found no text at all. */
 export class NoTextDetectedError extends Error {
   constructor(message = "No text detected in the image") {
     super(message);
@@ -75,17 +87,31 @@ export class NoTextDetectedError extends Error {
   }
 }
 
+export type OcrProvider = "google-vision" | "gemini";
+
 export interface TranscribeImageOptions {
-  /** Defaults to `process.env.GOOGLE_VISION_API_KEY`. */
+  /** Force a provider. Defaults to whichever API key is configured in the environment. */
+  provider?: OcrProvider;
+  /** Key for the selected provider. Defaults to that provider's environment variable. */
   apiKey?: string;
-  /** Optional OCR language hints, e.g. ["en"]. Leave undefined for auto-detect. */
+  /**
+   * Image MIME type. Only Gemini needs it (for inline data); when omitted it is
+   * sniffed from the file's magic bytes, falling back to `image/jpeg`.
+   */
+  mimeType?: string;
+  /** Gemini model override. Defaults to `GEMINI_MODEL` or a current Flash model. */
+  model?: string;
+  /**
+   * Optional language hints, e.g. ["en"]. Cloud Vision receives them as
+   * `languageHints`; Gemini gets them as one extra sentence in the prompt.
+   */
   languageHints?: string[];
   /** Injectable for tests. */
   fetchImpl?: typeof fetch;
 }
 
 export interface TranscribeImageResult {
-  /** Literal text from Vision. Only surrounding whitespace is trimmed. */
+  /** Literal text from the provider. Only surrounding whitespace is trimmed. */
   text: string;
 }
 
@@ -97,20 +123,120 @@ interface AnnotateResponse {
   }>;
 }
 
+interface InteractionResponse {
+  steps?: Array<{
+    type?: string;
+    content?: Array<{ type?: string; text?: string }>;
+  }>;
+}
+
 /**
- * Runs DOCUMENT_TEXT_DETECTION (Vision's handwriting-oriented OCR mode) over an
- * image buffer and returns the raw text.
+ * Runs OCR over an image buffer and returns the raw text.
  *
  * The text is never rewritten, spell-checked or "cleaned" — lower layers must
- * hand back exactly what Vision read.
+ * hand back exactly what the provider read.
  */
 export async function transcribeImage(
   image: Uint8Array,
   options: TranscribeImageOptions = {},
 ): Promise<TranscribeImageResult> {
+  const provider = resolveProvider(options);
+  return provider === "gemini"
+    ? transcribeWithGemini(image, options)
+    : transcribeWithCloudVision(image, options);
+}
+
+function resolveProvider(options: TranscribeImageOptions): OcrProvider {
+  if (options.provider) {
+    return options.provider;
+  }
+
+  // Cloud Vision wins when both keys are configured: it was the original
+  // provider, so a deployment that already had a key doesn't change engine.
+  if (usableKey(process.env.GOOGLE_VISION_API_KEY)) {
+    return "google-vision";
+  }
+  if (usableKey(process.env.GEMINI_API_KEY)) {
+    return "gemini";
+  }
+
+  throw new MissingCredentialsError(
+    "No OCR API key is set — expected GEMINI_API_KEY (Google AI Studio) or GOOGLE_VISION_API_KEY (Cloud Vision)",
+  );
+}
+
+/** A key that is present, non-blank and not the .env.example placeholder. */
+function usableKey(value: string | undefined): value is string {
+  return typeof value === "string" && value.trim() !== "" && !value.startsWith("your-");
+}
+
+/**
+ * Gemini API (Google AI Studio) via the Interactions endpoint. Multimodal,
+ * so the OCR "engine" is the model itself, instructed to transcribe verbatim.
+ */
+async function transcribeWithGemini(
+  image: Uint8Array,
+  options: TranscribeImageOptions,
+): Promise<TranscribeImageResult> {
+  const apiKey = options.apiKey ?? process.env.GEMINI_API_KEY;
+  if (!usableKey(apiKey)) {
+    throw new MissingCredentialsError("GEMINI_API_KEY is not set");
+  }
+
+  const model = options.model ?? process.env.GEMINI_MODEL ?? DEFAULT_GEMINI_MODEL;
+  const mimeType = options.mimeType ?? detectMimeType(image);
+  const fetchImpl = options.fetchImpl ?? fetch;
+
+  const body = JSON.stringify({
+    model,
+    // One-shot reading: don't have Google retain the interaction server-side.
+    store: false,
+    input: [
+      { type: "text", text: geminiInstructions(options.languageHints) },
+      { type: "image", mime_type: mimeType, data: toBase64(image) },
+    ],
+  });
+
+  let response: Response;
+  try {
+    response = await fetchImpl(GEMINI_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
+      body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "network error";
+    throw new VisionRequestError(`Could not reach the Gemini API: ${reason}`, 0);
+  }
+
+  const rawText = await response.text();
+  const payload = safeJson<InteractionResponse>(rawText);
+
+  if (!response.ok) {
+    throw mapUpstreamError(response.status, extractErrorMessage(payload) ?? rawText);
+  }
+
+  const text = stripCodeFence(extractInteractionText(payload)).trim();
+
+  if (text === "" || isNoTextReply(text)) {
+    throw new NoTextDetectedError();
+  }
+
+  return { text };
+}
+
+/**
+ * Runs DOCUMENT_TEXT_DETECTION (Vision's handwriting-oriented OCR mode) over an
+ * image buffer and returns the raw text.
+ */
+async function transcribeWithCloudVision(
+  image: Uint8Array,
+  options: TranscribeImageOptions,
+): Promise<TranscribeImageResult> {
   const apiKey = options.apiKey ?? process.env.GOOGLE_VISION_API_KEY;
-  if (!apiKey || apiKey.trim() === "" || apiKey.startsWith("your-")) {
-    throw new MissingCredentialsError();
+  if (!usableKey(apiKey)) {
+    throw new MissingCredentialsError("GOOGLE_VISION_API_KEY is not set");
   }
 
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -140,10 +266,10 @@ export async function transcribeImage(
   }
 
   const rawText = await response.text();
-  const payload = safeJson(rawText);
+  const payload = safeJson<AnnotateResponse>(rawText);
 
   if (!response.ok) {
-    throw mapHttpError(response.status, extractErrorMessage(payload) ?? rawText);
+    throw mapUpstreamError(response.status, extractErrorMessage(payload) ?? rawText);
   }
 
   const result = payload?.responses?.[0];
@@ -163,14 +289,65 @@ export async function transcribeImage(
   return { text: trimmed };
 }
 
-function mapHttpError(status: number, detail: string): Error {
+/** The instruction that keeps Gemini acting like an OCR engine, not a chatbot. */
+function geminiInstructions(languageHints?: string[]): string {
+  const lines = [
+    "Transcribe all handwritten text in this image exactly as written.",
+    "Keep the original spelling, punctuation, casing and line breaks — including mistakes.",
+    "Do not translate, correct, summarize or explain anything, and never add commentary.",
+    "Reply with the transcription only.",
+    `If the image contains no readable text, reply with exactly ${NO_TEXT_SENTINEL} and nothing else.`,
+  ];
+
+  if (languageHints?.length) {
+    lines.push(`The handwriting is expected to be in one of these languages: ${languageHints.join(", ")}.`);
+  }
+
+  return lines.join(" ");
+}
+
+/**
+ * Gemini replies with an `interactions` envelope; the transcription lives in
+ * the last `model_output` step (earlier steps may be internal "thoughts").
+ */
+function extractInteractionText(payload: InteractionResponse | null): string {
+  const steps = payload?.steps ?? [];
+  for (let index = steps.length - 1; index >= 0; index -= 1) {
+    const step = steps[index];
+    if (step?.type !== "model_output") {
+      continue;
+    }
+    return (step.content ?? [])
+      .filter((part): part is { type: string; text: string } => (
+        part.type === "text" && typeof part.text === "string"
+      ))
+      .map((part) => part.text)
+      .join("");
+  }
+  return "";
+}
+
+/** Models sometimes wrap their answer in a code fence; that fence isn't text on the page. */
+function stripCodeFence(text: string): string {
+  const trimmed = text.trim();
+  const match = /^```(?:\w+)?\r?\n([\s\S]*?)\r?\n?```$/.exec(trimmed);
+  return match?.[1] !== undefined ? match[1] : trimmed;
+}
+
+/** True when the model used the "nothing readable here" sentinel reply. */
+function isNoTextReply(text: string): boolean {
+  const firstLine = text.split(/\r?\n/, 1)[0]?.trim() ?? "";
+  return /^["'`]*NO_TEXT_DETECTED\b/i.test(firstLine);
+}
+
+function mapUpstreamError(status: number, detail: string): Error {
   if (/api key not valid|api_key_invalid/i.test(detail)) {
-    return new InvalidCredentialsError(detail || "Google Cloud Vision rejected the API key");
+    return new InvalidCredentialsError(detail || undefined);
   }
 
   // A valid key on a project that isn't set up yet. These are the two most common
   // deployment mistakes, so they get their own actionable errors instead of a
-  // generic upstream failure that reads like a Vision outage.
+  // generic upstream failure that reads like an outage.
   if (/billing/i.test(detail)) {
     return new BillingNotEnabledError(detail || undefined);
   }
@@ -180,29 +357,61 @@ function mapHttpError(status: number, detail: string): Error {
 
   if (status === 400 || status === 401 || status === 403) {
     if (/permission denied|not authorized/i.test(detail)) {
-      return new InvalidCredentialsError(detail || "Google Cloud Vision rejected the API key");
+      return new InvalidCredentialsError(detail || undefined);
     }
   }
   if (status === 429) {
-    return new VisionRequestError("Google Cloud Vision is rate limiting this project.", 429);
+    return new VisionRequestError("The OCR provider is rate limiting this project.", 429);
   }
-  return new VisionRequestError(detail || `Vision request failed with HTTP ${status}`, status);
+  return new VisionRequestError(detail || `OCR request failed with HTTP ${status}`, status);
 }
 
-function extractErrorMessage(payload: AnnotateResponse | null): string | undefined {
-  const message = (payload as { error?: { message?: string } } | null)?.error?.message;
+function extractErrorMessage(payload: unknown): string | undefined {
+  const message = (payload as { error?: { message?: unknown } } | null)?.error?.message;
   return typeof message === "string" ? message : undefined;
 }
 
-function safeJson(raw: string): AnnotateResponse | null {
+function safeJson<T>(raw: string): T | null {
   try {
-    return JSON.parse(raw) as AnnotateResponse;
+    return JSON.parse(raw) as T;
   } catch {
     return null;
   }
 }
 
-/** Base64 of the image bytes — the encoding Vision expects for inline content. */
+/** Base64 of the image bytes — the encoding both providers expect inline. */
 function toBase64(image: Uint8Array): string {
   return Buffer.from(image).toString("base64");
+}
+
+/** Magic-byte sniffing, used only when the caller can't supply a MIME type. */
+function detectMimeType(image: Uint8Array): string {
+  if (matchesAt(image, 0, [0x89, 0x50, 0x4e, 0x47])) return "image/png";
+  if (matchesAt(image, 0, [0xff, 0xd8, 0xff])) return "image/jpeg";
+  if (matchesAt(image, 0, [0x47, 0x49, 0x46, 0x38])) return "image/gif";
+  if (matchesAt(image, 0, [0x52, 0x49, 0x46, 0x46]) && matchesAt(image, 8, [0x57, 0x45, 0x42, 0x50])) {
+    return "image/webp";
+  }
+  // ISO base media files carry an "ftyp" box at offset 4; the brand names HEIC/HEIF.
+  if (matchesAt(image, 4, [0x66, 0x74, 0x79, 0x70])) {
+    const brand = asciiAt(image, 8, 4);
+    if (/^(heic|heix|hevc|hevx)$/.test(brand)) return "image/heic";
+    if (/^(mif1|msf1)$/.test(brand)) return "image/heif";
+  }
+  return "image/jpeg";
+}
+
+function matchesAt(bytes: Uint8Array, offset: number, signature: number[]): boolean {
+  if (bytes.length < offset + signature.length) {
+    return false;
+  }
+  return signature.every((byte, index) => bytes[offset + index] === byte);
+}
+
+function asciiAt(bytes: Uint8Array, offset: number, length: number): string {
+  let out = "";
+  for (let index = offset; index < offset + length && index < bytes.length; index += 1) {
+    out += String.fromCharCode(bytes[index] ?? 0);
+  }
+  return out;
 }
