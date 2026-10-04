@@ -11,7 +11,7 @@
 
 import { NextResponse } from "next/server";
 
-import { checkRateLimit, getClientKey } from "@/lib/rate-limit";
+import { checkRateLimit, getClientKey, type RateLimitResult } from "@/lib/rate-limit";
 import { MAX_FILE_BYTES, validateImageFile } from "@/lib/validation";
 import {
   InvalidCredentialsError,
@@ -42,15 +42,22 @@ export async function POST(request: Request): Promise<NextResponse> {
     );
   }
 
-  const rateLimit = checkRateLimit(getClientKey(request.headers));
+  const rateLimit = await checkRateLimit(getClientKey(request.headers));
   if (!rateLimit.ok) {
     return errorResponse(
       429,
       "rate_limited",
       `Too many transcriptions from this device. Try again in ${rateLimit.retryAfterSeconds}s.`,
-      { "Retry-After": String(rateLimit.retryAfterSeconds) },
+      {
+        "Retry-After": String(rateLimit.retryAfterSeconds),
+        ...rateLimitHeaders(rateLimit),
+      },
     );
   }
+
+  // Present on every answer after the limit check, so the limiter that handled
+  // a request is observable even when the request itself fails.
+  const rateHeaders = rateLimitHeaders(rateLimit);
 
   let form: FormData;
   try {
@@ -60,6 +67,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       400,
       "invalid_request",
       "We couldn't read that upload. Please try again.",
+      rateHeaders,
     );
   }
 
@@ -69,6 +77,7 @@ export async function POST(request: Request): Promise<NextResponse> {
       400,
       "invalid_request",
       'No image was included in the request (expected a "image" form field).',
+      rateHeaders,
     );
   }
 
@@ -78,35 +87,51 @@ export async function POST(request: Request): Promise<NextResponse> {
     size: entry.size,
   });
   if (!validation.ok) {
-    return errorResponse(validation.code === "too_large" ? 413 : 400, validation.code, validation.message);
+    return errorResponse(
+      validation.code === "too_large" ? 413 : 400,
+      validation.code,
+      validation.message,
+      rateHeaders,
+    );
   }
 
   let bytes: Uint8Array;
   try {
     bytes = new Uint8Array(await entry.arrayBuffer());
   } catch {
-    return errorResponse(400, "invalid_request", "We couldn't read that image. Please try again.");
+    return errorResponse(
+      400,
+      "invalid_request",
+      "We couldn't read that image. Please try again.",
+      rateHeaders,
+    );
   }
 
   if (bytes.byteLength === 0) {
-    return errorResponse(400, "empty_file", "That file is empty. Pick a photo and try again.");
+    return errorResponse(
+      400,
+      "empty_file",
+      "That file is empty. Pick a photo and try again.",
+      rateHeaders,
+    );
   }
 
   try {
     // Literal transcription only — no autocorrect, no rewriting.
     const { text } = await transcribeImage(bytes);
-    return NextResponse.json({ text }, { headers: NO_STORE });
+    return NextResponse.json({ text }, { headers: { ...NO_STORE, ...rateHeaders } });
   } catch (error) {
-    return mapError(error);
+    return mapError(error, rateHeaders);
   }
 }
 
-function mapError(error: unknown): NextResponse {
+function mapError(error: unknown, headers: Record<string, string>): NextResponse {
   if (error instanceof MissingCredentialsError) {
     return errorResponse(
       500,
       "missing_credentials",
       "This NoteSnap instance has no Google Cloud Vision key configured. Deployers: set GOOGLE_VISION_API_KEY in your environment and redeploy.",
+      headers,
     );
   }
 
@@ -115,6 +140,7 @@ function mapError(error: unknown): NextResponse {
       500,
       "invalid_credentials",
       "Google Cloud Vision rejected the configured API key. Deployers: check that the key is valid and that the Cloud Vision API is enabled for its project.",
+      headers,
     );
   }
 
@@ -123,6 +149,7 @@ function mapError(error: unknown): NextResponse {
       422,
       "no_text",
       "We couldn't find any handwriting in that photo. Try again with more light, less glare, and the page filling the frame.",
+      headers,
     );
   }
 
@@ -135,6 +162,7 @@ function mapError(error: unknown): NextResponse {
       502,
       "ocr_failed",
       "The transcription service didn't answer correctly. Please try again in a moment.",
+      headers,
     );
   }
 
@@ -143,10 +171,24 @@ function mapError(error: unknown): NextResponse {
     500,
     "unexpected_error",
     "Something went wrong while transcribing. Please try again.",
+    headers,
   );
 }
 
 const NO_STORE = { "Cache-Control": "no-store" } as const;
+
+/**
+ * Exposes which limiter answered (`shared` = Upstash Redis, `instance` = this
+ * process's memory) so a deployment's real protection is observable rather
+ * than assumed.
+ */
+function rateLimitHeaders(result: RateLimitResult): Record<string, string> {
+  return {
+    "X-RateLimit-Limit": String(result.limit),
+    "X-RateLimit-Remaining": String(result.remaining),
+    "X-RateLimit-Mode": result.mode,
+  };
+}
 
 function errorResponse(
   status: number,

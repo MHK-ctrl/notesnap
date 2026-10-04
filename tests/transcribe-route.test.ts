@@ -8,7 +8,7 @@ vi.mock("@/lib/vision", async (importOriginal) => {
 });
 
 import { POST } from "@/app/api/transcribe/route";
-import { resetRateLimitStore } from "@/lib/rate-limit";
+import { DEFAULT_RATE_LIMIT, resetRateLimitStore } from "@/lib/rate-limit";
 import { MAX_FILE_BYTES } from "@/lib/validation";
 import {
   InvalidCredentialsError,
@@ -35,6 +35,8 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.RATE_LIMIT_MAX;
   delete process.env.RATE_LIMIT_WINDOW_MS;
+  delete process.env.UPSTASH_REDIS_REST_URL;
+  delete process.env.UPSTASH_REDIS_REST_TOKEN;
 });
 
 function makeRequest(options: { file?: File; withField?: boolean; clientIp?: string } = {}) {
@@ -71,6 +73,18 @@ describe("POST /api/transcribe", () => {
     expect(response.status).toBe(200);
     expect(await readJson(response)).toEqual({ text: "Milk\nEggs\nBread" });
     expect(response.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("reports which limiter answered", async () => {
+    mockedTranscribe.mockResolvedValue({ text: "ok" });
+
+    const response = await POST(makeRequest());
+
+    // Without Upstash configured this build falls back to per-instance limiting;
+    // the header makes that visible instead of implied.
+    expect(response.headers.get("x-ratelimit-mode")).toBe("instance");
+    expect(response.headers.get("x-ratelimit-limit")).toBe(String(DEFAULT_RATE_LIMIT.limit));
+    expect(Number(response.headers.get("x-ratelimit-remaining"))).toBeGreaterThanOrEqual(0);
   });
 
   it("passes the raw image bytes to Vision", async () => {
@@ -165,6 +179,8 @@ describe("POST /api/transcribe", () => {
     const payload = await readJson(response);
     expect(payload.error?.code).toBe("missing_credentials");
     expect(payload.error?.message).toContain("GOOGLE_VISION_API_KEY");
+    // Failures still report which limiter handled the request.
+    expect(response.headers.get("x-ratelimit-mode")).toBe("instance");
   });
 
   it("reports an invalid API key distinctly", async () => {
@@ -220,6 +236,8 @@ describe("POST /api/transcribe", () => {
     expect(second.status).toBe(200);
     expect(third.status).toBe(429);
     expect(Number(third.headers.get("retry-after"))).toBeGreaterThan(0);
+    expect(third.headers.get("x-ratelimit-mode")).toBe("instance");
+    expect(third.headers.get("x-ratelimit-remaining")).toBe("0");
     expect((await readJson(third)).error?.code).toBe("rate_limited");
     expect(mockedTranscribe).toHaveBeenCalledTimes(2);
   });

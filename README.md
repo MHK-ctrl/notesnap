@@ -6,9 +6,15 @@
 [![Next.js 15](https://img.shields.io/badge/Next.js-15-black.svg)](https://nextjs.org)
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FMHK-ctrl%2Fnotesnap&env=GOOGLE_VISION_API_KEY&envDescription=Your%20own%20Google%20Cloud%20Vision%20API%20key%20%28server-side%20only%2C%20never%20exposed%20to%20the%20browser%29&envLink=https%3A%2F%2Fconsole.cloud.google.com%2Fapis%2Fcredentials&project-name=notesnap&repository-name=notesnap)
 
-<!-- Replace docs/screenshot.svg with a real screenshot or GIF of your own notes.
-     A 3-second GIF of snap → text does better than a still image. -->
-![NoteSnap screenshot](docs/screenshot.svg)
+![NoteSnap upload screen](docs/screenshot.png)
+
+![NoteSnap result screen](docs/screenshot-result-stubbed.png)
+
+<sub>Both images are real captures of this app at a 390px mobile viewport. The first is
+the upload screen. The second shows the result screen with a **stubbed transcription** —
+the OCR response was mocked so the capture could be taken without a Google Cloud key — and
+it carries a visible label saying so. Read it as a UI sample, not as an OCR result; a GIF
+of a real snap → text run is the next upgrade here.</sub>
 
 > ### 🔑 Each deployer brings their own Google Cloud credentials
 >
@@ -17,8 +23,12 @@
 > project**. Setup takes about five minutes — see
 > [Get a Vision API key](#get-a-google-cloud-vision-api-key-step-by-step).
 
-<!-- Fill this in after your first deploy: -->
-<!-- **Live demo:** https://your-project.vercel.app -->
+> ### 🔍 No public demo is hosted
+>
+> OCR costs money per image and is billed to whoever owns the key, so this
+> repository deliberately points at **no shared instance and no live URL**. Deploy
+> your own copy with the one-click button above, then add your key — about five
+> minutes, after which the URL is yours alone.
 
 ---
 
@@ -135,7 +145,57 @@ vercel --prod
 3. **Redeploy** — env changes only apply to new deployments.
 4. **Verify** — open the deployment URL on your phone, take a photo, and watch for text.
 
-> Optional: `RATE_LIMIT_MAX` (default `10`) and `RATE_LIMIT_WINDOW_MS` (default `60000`) tune the API route's rate limit.
+### Environment variables (all of them)
+
+| Variable | Required | What it does |
+| --- | --- | --- |
+| `GOOGLE_VISION_API_KEY` | **Yes** | Authenticates OCR calls. Server-side only — never prefix it with `NEXT_PUBLIC_`. |
+| `UPSTASH_REDIS_REST_URL` | Recommended | Shared rate-limit store. Without it, limiting is per-instance only. |
+| `UPSTASH_REDIS_REST_TOKEN` | Recommended | REST token paired with that URL. |
+| `RATE_LIMIT_MAX` | No | Requests allowed per client per window (default `10`). |
+| `RATE_LIMIT_WINDOW_MS` | No | Window length in milliseconds (default `60000`). |
+
+```bash
+# add the shared limiter to an existing deployment
+vercel env add UPSTASH_REDIS_REST_URL production     # https://your-db.upstash.io
+vercel env add UPSTASH_REDIS_REST_TOKEN production   # paste the REST token when prompted
+vercel --prod                                        # env changes need a new deployment
+```
+
+## Shared rate limiting (Upstash Redis)
+
+A rate limiter that lives in one process's memory can't protect a serverless app:
+Vercel runs several instances, each with its own counter. `lib/rate-limit.ts`
+therefore uses [@upstash/ratelimit](https://github.com/upstash/ratelimit) with a
+sliding window over Upstash Redis, so all instances share one counter.
+
+**Setup (no code changes needed):**
+
+1. Create a database at <https://console.upstash.com> — **Create Database**, pick a
+   region close to your users, Redis type is fine.
+2. On the database page, copy the **REST URL** and the **REST TOKEN**.
+3. Add both to your environment (locally in `.env.local`; on Vercel via the
+   commands above or *Settings → Environment Variables*).
+4. Redeploy and check which limiter answered:
+
+   ```bash
+   curl -s -D - -o /dev/null -F "image=@note.jpg" https://your-app.vercel.app/api/transcribe \
+     | grep -i x-ratelimit-mode
+   # X-RateLimit-Mode: shared
+   ```
+
+**Free tier:** Upstash's free plan is 500,000 commands/month, 256 MB storage and
+10 GB bandwidth (as published in 2026 — see
+<https://upstash.com/pricing/redis> for the current numbers). One rate-limit check
+is a couple of commands, so the free tier covers far more traffic than a demo
+gets; the limit that will bite first is Google's ~1,000 free Vision images.
+
+**Behaviour when Redis fails:** the route logs
+`shared rate limiter unavailable`, serves the request anyway, and reports
+`X-RateLimit-Mode: instance` — a public demo stays usable during an Upstash
+outage, at the cost of degraded limiting until it recovers. If you'd rather fail
+closed, throw from `checkRateLimit` instead of falling through in
+`lib/rate-limit.ts`.
 
 ## Cost & limits
 
@@ -154,14 +214,17 @@ Built-in limits to protect a public demo:
 | --- | --- | --- |
 | Max upload size | 10 MB | `lib/validation.ts` (client *and* server) |
 | Photos resized before upload | longest edge 2200px | `lib/image.ts` (browser) |
-| Requests per client IP | 10 / 60s | `lib/rate-limit.ts`, tune with `RATE_LIMIT_MAX` |
+| Requests per client IP | 10 / 60s | `lib/rate-limit.ts` — Upstash sliding window, per-instance fallback |
 
-**About the rate limiter:** it's in-memory, per serverless instance, so on Vercel
-a burst across several cold instances can exceed the nominal limit. It's a speed
-bump, not a hard quota. For a hard cap, swap `lib/rate-limit.ts` for
-[Upstash Ratelimit](https://github.com/upstash/ratelimit) (or put your own auth in
-front of the route). Also consider a **budget alert** in Google Cloud billing so
-you hear about traffic spikes before your card does.
+**About the rate limiter:** with `UPSTASH_REDIS_REST_URL` and `_TOKEN` set, counters
+live in Redis and every serverless instance shares them, so the limit is real
+protection rather than a speed bump (see
+[Shared rate limiting](#shared-rate-limiting-upstash-redis)). Without those vars the
+route falls back to a per-instance counter and logs a warning in production — the
+`X-RateLimit-Mode` response header always tells you which mode answered.
+
+Either way, add a **budget alert** in Google Cloud billing so you hear about traffic
+spikes before your card does.
 
 ## Troubleshooting
 
@@ -175,6 +238,8 @@ you hear about traffic spikes before your card does.
 | HEIC photos from an iPhone fail | Your browser can't decode HEIC for compression, so the original is sent | Safari handles HEIC; if it still fails, set *Settings → Camera → Formats → Most Compatible*, or export as JPEG. |
 | Copy button says "Press Ctrl/Cmd + C" | Non-secure origin — the clipboard API is blocked | Serve over HTTPS (Vercel does this) or use `localhost`. |
 | `rate_limited` (429) | More than 10 transcriptions in a minute from one IP | Wait a minute, or raise `RATE_LIMIT_MAX`. |
+| `X-RateLimit-Mode: instance` in production | Upstash env vars are missing, so the limiter is per-instance only | Add `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` (see [Shared rate limiting](#shared-rate-limiting-upstash-redis)) and redeploy. |
+| Logs say "shared rate limiter unavailable" | Redis was unreachable; the route kept serving on the per-instance fallback | Check the Upstash database is active and the REST token is correct for **both** Production and Preview environments. |
 | `413 too_large` | Photo is over 10 MB | Lower the camera resolution, or raise `MAX_FILE_BYTES` in `lib/validation.ts`. |
 | Everything works locally, fails on Vercel | Env var added after the last deploy | Redeploy — environment variables are read at runtime, but only new deployments pick them up. |
 
@@ -188,9 +253,10 @@ npm run typecheck  # tsc --noEmit
 npm test           # Vitest unit tests
 ```
 
-Tests cover the shared validation rules, the image-resize math, the rate limiter,
-the Vision wrapper (with an injected `fetch`) and the API route's happy and
-failure paths — no Google credentials required to run them.
+The suite covers the shared validation rules, the image-resize math, both rate
+limiter modes (the Upstash wiring is mocked, so no account is needed), the Vision
+wrapper (with an injected `fetch`) and the API route's happy and failure paths —
+**no Google, Vercel or Upstash credentials required**.
 
 ## Project structure
 
@@ -204,7 +270,7 @@ components/TranscriptEditor.tsx editable result + copy / re-transcribe / start o
 lib/image.ts                    browser-side resize + re-encode
 lib/vision.ts                   Google Cloud Vision wrapper (server-only)
 lib/validation.ts               file type + size checks (shared client/server)
-lib/rate-limit.ts               in-memory per-IP limiter
+lib/rate-limit.ts               rate limiter: Upstash sliding window + per-instance fallback
 tests/                          Vitest unit tests
 ```
 
