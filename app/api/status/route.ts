@@ -20,7 +20,9 @@ import {
   getSharedStore,
   isQuotaBreakerSet,
   readDemoBudgetStatus,
+  readThrottle,
 } from "@/lib/demo-quota";
+import type { ProviderState } from "@/lib/vision";
 import { nextPacificMidnight, secondsUntil } from "@/lib/pacific-time";
 
 export const runtime = "nodejs";
@@ -39,9 +41,32 @@ export async function GET(): Promise<NextResponse> {
 
   const budget = await readDemoBudgetStatus(store, now);
   const breaker = store ? await isQuotaBreakerSet(store, DEMO_PROVIDER, DEMO_MODEL, now) : false;
+  const throttle = await readThrottle(store, DEMO_PROVIDER, DEMO_MODEL, now);
 
-  // "Available" means a visitor's own request would actually be served: the
-  // shared store has to be reachable and the provider quota must not be spent.
+  /**
+   * Provider state, derived from evidence in the shared store rather than
+   * assumed:
+   *
+   * - `daily_quota_exhausted` — a confirmed per-day quota rejection. Resets at
+   *   midnight Pacific, because that is when the provider's limit renews.
+   * - `temporarily_throttled` — a 429 we could classify as short-lived. The wait
+   *   is the provider's own, bounded by the store.
+   * - `unknown` — no shared store, so we cannot know. Reported as unknown rather
+   *   than "ready", which would be a claim we cannot support.
+   * - `ready` — no breaker and no throttle recorded.
+   */
+  const providerState: ProviderState = breaker
+    ? "daily_quota_exhausted"
+    : throttle.active
+      ? "temporarily_throttled"
+      : store
+        ? "ready"
+        : "unknown";
+
+  // `available` means a visitor's request would actually be served: the shared
+  // store must be reachable (so the budget is enforced) and the provider must not
+  // be shut against us. A throttle is a pause, not a closure, so it does not make
+  // the demo unavailable — it just means "wait N seconds".
   const available = budget.available && !breaker;
 
   return NextResponse.json(
@@ -58,6 +83,13 @@ export async function GET(): Promise<NextResponse> {
       quota: {
         exhausted: breaker,
         resetsAt: new Date(resetsAt).toISOString(),
+      },
+      provider: {
+        state: providerState,
+        /** Epoch ms a daily limit frees up; null when not day-blocked. */
+        resetsAt: breaker ? new Date(resetsAt).toISOString() : null,
+        /** Seconds to wait out a transient throttle; 0 otherwise. */
+        retryAfterSeconds: throttle.active ? throttle.retryAfterSeconds : 0,
       },
       /** Seconds until the daily budget frees up, so clients need not do date math. */
       resetsInSeconds: secondsUntil(now.getTime(), resetsAt),

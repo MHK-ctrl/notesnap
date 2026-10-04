@@ -30,6 +30,11 @@ interface DemoStatus {
     perIpDailyLimit: number;
   };
   quota: { exhausted: boolean; resetsAt: string };
+  provider: {
+    state: "ready" | "daily_quota_exhausted" | "temporarily_throttled" | "unknown";
+    resetsAt: string | null;
+    retryAfterSeconds: number;
+  };
   /** Note: top-level, not nested under `demo`. */
   resetsInSeconds: number;
 }
@@ -44,6 +49,11 @@ const UNKNOWN_STATUS: DemoStatus = {
     perIpDailyLimit: 0,
   },
   quota: { exhausted: false, resetsAt: "" },
+  provider: {
+    state: "unknown",
+    resetsAt: null,
+    retryAfterSeconds: 0,
+  },
   resetsInSeconds: 0,
 };
 
@@ -219,7 +229,8 @@ export default function HomePage() {
         remaining={demoStatus.demo.remaining}
         limit={demoStatus.demo.limit}
         available={demoStatus.demo.available}
-        quotaExhausted={demoStatus.quota.exhausted}
+        providerState={demoStatus.provider.state}
+        retryAfterSeconds={demoStatus.provider.retryAfterSeconds}
         resetsInSeconds={demoStatus.resetsInSeconds}
         userKey={userKey}
         onUserKeyChange={setUserKey}

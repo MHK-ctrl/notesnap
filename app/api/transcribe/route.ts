@@ -16,7 +16,12 @@ import {
   consumeDemoBudget,
   getSharedStore,
   isQuotaBreakerSet,
+  readThrottle,
+  refundDemoBudget,
   setQuotaBreaker,
+  setThrottle,
+  type BudgetReservation,
+  type ThrottleState,
 } from "@/lib/demo-quota";
 import { nextPacificMidnight, secondsUntil } from "@/lib/pacific-time";
 import { checkRateLimit, getClientKey, type RateLimitResult } from "@/lib/rate-limit";
@@ -29,6 +34,7 @@ import {
   MissingCredentialsError,
   NoTextDetectedError,
   ProviderQuotaExceededError,
+  ThrottledProviderError,
   transcribeImage,
   VisionRequestError,
   RetryableProviderError,
@@ -98,12 +104,9 @@ export async function POST(request: Request): Promise<NextResponse> {
       return quotaExhaustedResponse(rateHeaders);
     }
 
-    const budget = await consumeDemoBudget(store, getClientKey(request.headers));
-    if (!budget.ok) {
-      return budgetResponse(budget, rateHeaders);
-    }
-    if (typeof budget.remaining === "number") {
-      rateHeaders["X-Demo-Remaining"] = String(budget.remaining);
+    const throttle = await readThrottle(store, DEMO_PROVIDER, DEMO_MODEL);
+    if (throttle.active) {
+      return throttledResponse(throttle, rateHeaders);
     }
   }
 
@@ -164,6 +167,22 @@ export async function POST(request: Request): Promise<NextResponse> {
     );
   }
 
+  // The demo budget is charged here, after the upload is known to be valid, and
+  // before the provider call. Charging it any earlier would burn a visitor's
+  // daily allowance on uploads that never become a request, and would stop the
+  // app from ever observing provider state once the budget ran out.
+  let reservation: BudgetReservation | undefined;
+  if (!userKey && store) {
+    const budget = await consumeDemoBudget(store, getClientKey(request.headers));
+    if (!budget.ok) {
+      return budgetResponse(budget, rateHeaders);
+    }
+    reservation = budget.reservation;
+    if (typeof budget.remaining === "number") {
+      rateHeaders["X-Demo-Remaining"] = String(budget.remaining);
+    }
+  }
+
   try {
     // Literal transcription only — no autocorrect, no rewriting. The declared
     // MIME type matters to Gemini's inline image data; the adapter sniffs the
@@ -175,16 +194,60 @@ export async function POST(request: Request): Promise<NextResponse> {
     });
     return NextResponse.json({ text }, { headers: { ...NO_STORE, ...rateHeaders } });
   } catch (error) {
-    if (error instanceof ProviderQuotaExceededError && store && !userKey) {
-      // Remember it so the next visitor is turned away without spending a request
-      // to rediscover the same wall. The TTL expires at the Pacific reset.
-      await setQuotaBreaker(store, error.provider, DEMO_MODEL).catch((storeError) => {
-        console.error("[notesnap] could not record the provider quota state", storeError);
-      });
-      return quotaExhaustedResponse(rateHeaders);
+    // Refund only what we know did not reach the provider. Ambiguous outcomes
+    // (timeout, 5xx after sending) keep their reservation, because Google may
+    // still have counted them.
+    if (store && reservation && !userKey && isConfirmedProviderRejection(error)) {
+      await refundDemoBudget(store, reservation);
     }
+
+    if (store && !userKey) {
+      if (error instanceof ProviderQuotaExceededError) {
+        // Remember it so the next visitor is turned away without spending a
+        // request to rediscover the same wall. Expires at the Pacific reset.
+        await setQuotaBreaker(store, error.provider, DEMO_MODEL).catch((storeError) => {
+          console.error("[notesnap] could not record the provider quota state", storeError);
+        });
+        return quotaExhaustedResponse(rateHeaders);
+      }
+
+      if (error instanceof ThrottledProviderError) {
+        // Short, shared cooldown — every instance backs off together instead of
+        // each spending requests to rediscover the throttle.
+        await setThrottle(store, DEMO_PROVIDER, DEMO_MODEL, error.retryAfterSeconds).catch(
+          (storeError) => {
+            console.error("[notesnap] could not record the provider throttle", storeError);
+          },
+        );
+        return errorResponse(
+          429,
+          "provider_busy",
+          `The OCR provider is busy right now. Trying again in about ${error.retryAfterSeconds}s should work — your photo wasn't the problem.`,
+          rateHeaders,
+          { "Retry-After": String(error.retryAfterSeconds) },
+        );
+      }
+    }
+
     return mapError(error, rateHeaders, userKey);
   }
+}
+
+/**
+ * True when the provider definitely refused the request without consuming quota.
+ *
+ * These are the cases a refund is safe for: a clearly rejected key, a disabled
+ * API, a missing billing account, or a confirmed daily-quota wall. Anything
+ * ambiguous — timeouts, network drops, 5xx after the bytes were sent — is
+ * deliberately excluded, because the provider may still have counted it.
+ */
+function isConfirmedProviderRejection(error: unknown): boolean {
+  return (
+    error instanceof ProviderQuotaExceededError ||
+    error instanceof InvalidCredentialsError ||
+    error instanceof ApiNotEnabledError ||
+    error instanceof BillingNotEnabledError
+  );
 }
 
 /** 429 once the provider confirms its daily quota is spent for this project. */
@@ -196,6 +259,20 @@ function quotaExhaustedResponse(headers: Record<string, string>): NextResponse {
     `The demo's free OCR quota is used up for today and resets at midnight Pacific. ${BRING_YOUR_OWN_KEY_HINT}`,
     headers,
     { "Retry-After": String(secondsUntil(Date.now(), resetsAt)) },
+  );
+}
+
+/** 429 while the provider is throttling us, but the day is not over. */
+function throttledResponse(
+  throttle: ThrottleState,
+  headers: Record<string, string>,
+): NextResponse {
+  return errorResponse(
+    429,
+    "provider_busy",
+    `The OCR provider is busy right now. Trying again in about ${throttle.retryAfterSeconds}s should work — your photo wasn't the problem.`,
+    headers,
+    { "Retry-After": String(Math.max(1, throttle.retryAfterSeconds)) },
   );
 }
 

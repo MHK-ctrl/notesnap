@@ -30,6 +30,12 @@ function fakeStore(): SharedStore & { values: Map<string, string> } {
       values.set(key, String(next));
       return next;
     },
+    decrementFloorZero: async (key) => {
+      const current = Number.parseInt(values.get(key) ?? "0", 10);
+      const next = Math.max(0, current - 1);
+      values.set(key, String(next));
+      return next;
+    },
     setExpiring: async (key, value) => {
       values.set(key, value);
     },
@@ -214,6 +220,7 @@ describe("consumeDemoBudget", () => {
       increment: async () => {
         throw new Error("ECONNREFUSED");
       },
+      decrementFloorZero: async () => 0,
       setExpiring: async () => undefined,
       get: async () => null,
       expire: async () => undefined,

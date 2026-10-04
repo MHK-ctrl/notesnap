@@ -102,6 +102,7 @@ function blockBudget(reason: "per_ip_daily" | "global_daily" | "store_unavailabl
 function stubStore() {
   return {
     increment: async () => 0,
+    decrementFloorZero: async () => 0,
     setExpiring: async () => undefined,
     get: async () => null,
     expire: async () => undefined,

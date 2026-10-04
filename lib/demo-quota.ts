@@ -52,6 +52,13 @@ const BREAKER_TTL_SECONDS = 26 * 60 * 60;
 export interface SharedStore {
   /** Atomically increments `key`, returning the value *after* the increment. */
   increment(key: string): Promise<number>;
+  /**
+   * Atomically decrements `key`, never below zero.
+   *
+   * Refunds depend on this being a single atomic step: a read-then-write would
+   * lose concurrent refunds and drift the counter upward permanently.
+   */
+  decrementFloorZero(key: string): Promise<number>;
   /** Sets `key` with a TTL in seconds. */
   setExpiring(key: string, value: string, ttlSeconds: number): Promise<void>;
   /** Reads a string value, or null when the key is absent or expired. */
@@ -71,6 +78,24 @@ export function getSharedStore(): SharedStore | null {
   const redis = Redis.fromEnv();
   return {
     increment: async (key) => redis.incr(key),
+    decrementFloorZero: async (key) => {
+      // DECRBY can go negative under a race; clamp in a single Lua script so the
+      // read-modify-write is atomic and the counter can never drift below 0.
+      const result = await redis.eval(
+        `
+        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+        if current <= 0 then
+          redis.call('SET', KEYS[1], '0')
+          return 0
+        end
+        return redis.call('DECRBY', KEYS[1], 1)
+        `,
+        [key],
+        // The script takes one KEYS entry; the third parameter is the args array.
+        [],
+      );
+      return typeof result === "number" ? result : Number(result ?? 0);
+    },
     setExpiring: async (key, value, ttlSeconds) => {
       await redis.set(key, value, { ex: ttlSeconds });
     },
@@ -128,6 +153,11 @@ export interface BudgetDecision {
   resetsAt?: number;
   /** Remaining demo transcriptions after this request, when known. */
   remaining?: number;
+  /**
+   * The counters this request reserved, so it can be refunded if the request
+   * turns out never to have reached the provider.
+   */
+  reservation?: BudgetReservation;
 }
 
 /** True when the provider already told us its daily quota is spent for today. */
@@ -185,16 +215,20 @@ export async function consumeDemoBudget(
   clientKey: string,
   now: Date = new Date(),
 ): Promise<BudgetDecision> {
-  const dateKey = pacificDateKey(now);
   const resetsAt = nextPacificMidnight(now);
   const globalLimit = getGlobalDailyMax();
   const perIpLimit = getPerIpDailyMax();
 
+  const reservation: BudgetReservation = {
+    globalKey: globalDayKey(now),
+    perIpKey: perIpDayKey(clientKey, now),
+  };
+
   let perIpUsed: number;
   let globalUsed: number;
   try {
-    perIpUsed = await store.increment(`${PREFIX}:ipday:${dateKey}:${clientKey}`);
-    globalUsed = await store.increment(`${PREFIX}:global:${dateKey}`);
+    perIpUsed = await store.increment(reservation.perIpKey);
+    globalUsed = await store.increment(reservation.globalKey);
   } catch (error) {
     // Fail closed: without a shared counter we cannot know today's spend, and
     // serving anyway is exactly how a quota gets spent invisibly.
@@ -204,8 +238,8 @@ export async function consumeDemoBudget(
 
   const ttl = Math.max(60, Math.ceil((resetsAt - now.getTime()) / 1000));
   await Promise.all([
-    expireAtReset(store, `${PREFIX}:ipday:${dateKey}:${clientKey}`, ttl),
-    expireAtReset(store, `${PREFIX}:global:${dateKey}`, ttl),
+    expireAtReset(store, reservation.perIpKey, ttl),
+    expireAtReset(store, reservation.globalKey, ttl),
   ]).catch((error) => {
     // A missing TTL would let counters outlive the Pacific day; log loudly
     // rather than throw, since the request is already accounted for.
@@ -213,14 +247,19 @@ export async function consumeDemoBudget(
   });
 
   if (globalUsed > globalLimit) {
-    return { ok: false, reason: "global_daily", resetsAt, remaining: 0 };
+    return { ok: false, reason: "global_daily", resetsAt, remaining: 0, reservation };
   }
 
   if (perIpUsed > perIpLimit) {
-    return { ok: false, reason: "per_ip_daily", resetsAt, remaining: 0 };
+    return { ok: false, reason: "per_ip_daily", resetsAt, remaining: 0, reservation };
   }
 
-  return { ok: true, remaining: Math.max(0, globalLimit - globalUsed), resetsAt };
+  return {
+    ok: true,
+    remaining: Math.max(0, globalLimit - globalUsed),
+    resetsAt,
+    reservation,
+  };
 }
 
 /**
@@ -268,6 +307,141 @@ export async function readDemoBudgetStatus(
 
 function breakerKey(provider: string, model: string, now: Date): string {
   return `${PREFIX}:breaker:${provider}:${model}:${pacificDateKey(now)}`;
+}
+
+/** Counter key for the global daily demo budget on a Pacific date. */
+function globalDayKey(now: Date): string {
+  return `${PREFIX}:global:${pacificDateKey(now)}`;
+}
+
+/** Counter key for one visitor's daily demo budget on a Pacific date. */
+function perIpDayKey(clientKey: string, now: Date): string {
+  return `${PREFIX}:ipday:${pacificDateKey(now)}:${clientKey}`;
+}
+
+/** The exact counters a single budget decision reserved. */
+export interface BudgetReservation {
+  globalKey: string;
+  perIpKey: string;
+}
+
+/**
+ * Refunds a reservation, but only for failures we know the provider refused.
+ *
+ * The rule is deliberately asymmetric:
+ *
+ * - A request that never reached the provider (bad upload, client gone,
+ *   validation) used no provider quota, so refunding is correct.
+ * - A provider that *clearly rejected* the request (invalid key, daily quota
+ *   gone) did not consume quota either, so refunding is correct.
+ * - An ambiguous outcome — timeout, dropped connection, a 5xx after we sent the
+ *   bytes — is **not** refunded, because Google may still have processed and
+ *   billed the request. Refunding those would let a client retry indefinitely
+ *   against quota that was actually spent.
+ *
+ * Refunds never re-arm a breaker or reset a burst window; those track attempts,
+ * not successes.
+ */
+export async function refundDemoBudget(
+  store: SharedStore,
+  reservation: BudgetReservation,
+): Promise<boolean> {
+  try {
+    await Promise.all([
+      store.decrementFloorZero(reservation.globalKey),
+      store.decrementFloorZero(reservation.perIpKey),
+    ]);
+    return true;
+  } catch (error) {
+    // Losing a refund under-counts usage, which is the safe direction: it makes
+    // the demo more conservative, not less.
+    console.error("[notesnap] could not refund a demo budget reservation", error);
+    return false;
+  }
+}
+
+/**
+ * A short, shared "provider is busy right now" pause.
+ *
+ * Distinct from {@link breakerKey}, which lasts the whole Pacific day. This one
+ * exists so every serverless instance stops calling a provider that is
+ * throttling us, instead of each spending requests to rediscover the limit. The
+ * TTL is whatever the provider asked for, bounded so a bad value cannot pin the
+ * demo shut for hours.
+ */
+function throttleKey(provider: string, model: string): string {
+  return `${PREFIX}:throttle:${provider}:${model}`;
+}
+
+/** Hard ceiling on a throttle pause, whatever the provider or caller asked for. */
+export const MAX_THROTTLE_COOLDOWN_SECONDS = 120;
+
+/** How long the shared throttle stays set when no provider hint is available. */
+export const DEFAULT_THROTTLE_COOLDOWN_SECONDS = 15;
+
+export interface ThrottleState {
+  active: boolean;
+  /** Epoch ms when the throttle lifts, or null when inactive/unreadable. */
+  retryAfterSeconds: number;
+  resetsAt: number | null;
+}
+
+/**
+ * Reads the shared throttle. Never throws — an unreachable store is reported as
+ * "no throttle" so a Redis blip cannot present itself as a provider outage.
+ */
+export async function readThrottle(
+  store: SharedStore | null,
+  provider: string,
+  model: string,
+  now: Date = new Date(),
+): Promise<ThrottleState> {
+  if (!store) {
+    return { active: false, retryAfterSeconds: 0, resetsAt: null };
+  }
+
+  try {
+    const value = Number.parseInt((await store.get(throttleKey(provider, model))) ?? "", 10);
+    if (!Number.isFinite(value) || value <= 0) {
+      return { active: false, retryAfterSeconds: 0, resetsAt: null };
+    }
+
+    // The stored value is a TTL in seconds, so it doubles as the remaining wait.
+    return {
+      active: true,
+      retryAfterSeconds: value,
+      resetsAt: now.getTime() + value * 1000,
+    };
+  } catch (error) {
+    console.error("[notesnap] could not read the provider throttle", error);
+    return { active: false, retryAfterSeconds: 0, resetsAt: null };
+  }
+}
+
+/** Sets the shared throttle for `seconds`, clamped to the hard ceiling. */
+export async function setThrottle(
+  store: SharedStore,
+  provider: string,
+  model: string,
+  seconds: number,
+): Promise<void> {
+  const bounded = Math.max(
+    1,
+    Math.min(
+      Number.isFinite(seconds) && seconds > 0 ? seconds : DEFAULT_THROTTLE_COOLDOWN_SECONDS,
+      MAX_THROTTLE_COOLDOWN_SECONDS,
+    ),
+  );
+  await store.setExpiring(throttleKey(provider, model), String(bounded), bounded);
+}
+
+/** Clears the shared throttle. Exposed for tests and operator recovery. */
+export async function clearThrottle(
+  store: SharedStore,
+  provider: string,
+  model: string,
+): Promise<void> {
+  await store.del(throttleKey(provider, model));
 }
 
 export { secondsUntil };

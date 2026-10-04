@@ -33,25 +33,26 @@ const RETRYABLE_UPSTREAM_STATUSES = new Set([408, 425, 500, 502, 503, 504]);
 const MAX_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 400;
 
+/**
+ * How long to pause before the next request when a 429 can't be classified.
+ *
+ * Deliberately short. An ambiguous 429 might be a brief throttle, and guessing
+ * "a minute" would stall a working demo; guessing "all day" would take the demo
+ * down over a transient blip. A short shared cooldown is the conservative choice
+ * in both directions — the shared store means every instance backs off together
+ * rather than each discovering the limit on its own.
+ */
+const DEFAULT_THROTTLE_COOLDOWN_SECONDS = 15;
+
+/** Provider states surfaced by `/api/status` and the UI. */
+export type ProviderState =
+  | "ready"
+  | "daily_quota_exhausted"
+  | "temporarily_throttled"
+  | "unknown";
+
 function isRetryableUpstreamStatus(status: number): boolean {
   return RETRYABLE_UPSTREAM_STATUSES.has(status);
-}
-
-/**
- * True when a provider error means the *daily quota* is gone rather than the
- * request being throttled.
- *
- * Google distinguishes these in the message: quota exhaustion mentions quota or
- * the `RESOURCE_EXHAUSTED`/`quota_exceeded` codes, while a momentary throttle
- * says "rate limit". Only the first is a whole-day condition, and only the first
- * should stop the app from calling the provider again until the next reset.
- *
- * When this can't be determined we return false on purpose. Treating an unknown
- * 429 as exhausted would close the demo for the rest of the day on a transient
- * error; treating an exhausted quota as transient just costs a few retries.
- */
-function isQuotaExceededDetail(detail: string): boolean {
-  return /quota|resource_exhausted|exceeded your current quota|quota_exceeded/i.test(detail);
 }
 
 function sleep(ms: number): Promise<void> {
@@ -107,6 +108,23 @@ export class BillingNotEnabledError extends Error {
 }
 
 /** Anything else that went wrong while talking to the provider. */
+/**
+ * A transient rate limit. Carries the provider's own wait (or the short default
+ * cooldown) so the UI can say "busy — retrying is fine in ~Ns" instead of
+ * implying the day is over.
+ */
+export class ThrottledProviderError extends Error {
+  readonly retryAfterSeconds: number;
+  readonly evidence: string;
+
+  constructor(retryAfterSeconds: number, evidence: string) {
+    super(`The OCR provider is rate limiting this project; retry in ${retryAfterSeconds}s.`);
+    this.name = "ThrottledProviderError";
+    this.retryAfterSeconds = retryAfterSeconds;
+    this.evidence = evidence;
+  }
+}
+
 /**
  * The provider confirmed its per-project daily quota is spent.
  *
@@ -201,6 +219,143 @@ interface InteractionResponse {
     type?: string;
     content?: Array<{ type?: string; text?: string }>;
   }>;
+}
+
+/**
+ * Shape of the error envelope Google returns. Only the fields this app acts on
+ * are modelled; everything else is left untyped so a provider addition can't
+ * silently change behaviour.
+ */
+interface ProviderErrorEnvelope {
+  error?: {
+    code?: number | string;
+    message?: string;
+    status?: string;
+    /** Structured, machine-readable reasons. Preferred over message matching. */
+    details?: Array<{
+      "@type"?: string;
+      reason?: string;
+      /** e.g. "GenerateRequestsPerDay" — a per-day metric means a day-long lock. */
+      quotaMetric?: string;
+      quotaId?: string;
+      retryDelay?: string;
+    }>;
+  };
+}
+
+/**
+ * Quota metric fragments that mean the limit resets on a daily boundary.
+ *
+ * Google's metric names read like `GenerateRequestsPerDay` / `PerDay`, so a
+ * case-insensitive `perday` match is the reliable signal. Anything not matching
+ * (per-minute, per-token, generic "quota exceeded") is deliberately NOT treated
+ * as daily — misreading it would lock the app out for a day over a throttle.
+ */
+const DAILY_METRIC_PATTERN = /perday|per_day|daily/i;
+
+/**
+ * Message patterns that unambiguously mean the daily allowance is gone.
+ *
+ * Kept narrow on purpose. Each one requires an explicit per-day/exhausted phrase;
+ * a bare "quota exceeded" is NOT enough, because Google also uses that wording
+ * for short-lived throttling. An unrecognised 429 falls through to a short
+ * cooldown rather than a day-long breaker — being wrong in that direction costs
+ * seconds, while being wrong the other way costs visitors a full day.
+ */
+const DAILY_MESSAGE_PATTERNS: readonly RegExp[] = [
+  /exceeded your current quota.*per (day|daily)/i,
+  /quota exceeded for quota metric:.*per ?day/i,
+  /requests per day.*(exceeded|exhausted)/i,
+  /daily (quota|limit|request).*(exceeded|exhausted)/i,
+  /(exceeded|exhausted).*daily (quota|limit|request)/i,
+];
+
+/** `RetryInfo` delays are only trusted within this bound. */
+const MAX_TRUSTED_RETRY_DELAY_SECONDS = 300;
+
+/**
+ * Classifies a 429 from the provider, most-trustworthy signal first.
+ *
+ * Order matters and is the whole point of this function:
+ *
+ * 1. **Structured details** — a `quotaMetric` naming a per-day limit is
+ *    machine-readable evidence, not a guess.
+ * 2. **Narrow message patterns** — only phrases that explicitly say "per day".
+ * 3. **A valid `RetryInfo` / `Retry-After`** — the provider told us when to come
+ *    back, so use exactly that wait.
+ * 4. **Otherwise: transient**, with a bounded shared cooldown. Never a day-long
+ *    lock, and never an invented 60s wait.
+ */
+export type ProviderLimitVerdict =
+  | { kind: "daily_quota_exhausted"; evidence: string }
+  | { kind: "temporarily_throttled"; retryAfterSeconds: number; evidence: string };
+
+export function classifyRateLimit(
+  payload: unknown,
+  retryAfterHeader: string | null,
+): ProviderLimitVerdict {
+  const envelope = safeJson<ProviderErrorEnvelope>(JSON.stringify(payload ?? null)) as
+    | ProviderErrorEnvelope
+    | undefined;
+  const details = envelope?.error?.details ?? [];
+  const message = envelope?.error?.message ?? "";
+
+  // 1. Structured details.
+  for (const detail of details) {
+    const metric = detail?.quotaMetric;
+    if (metric && DAILY_METRIC_PATTERN.test(metric)) {
+      return {
+        kind: "daily_quota_exhausted",
+        evidence: `quotaMetric=${metric}${detail.quotaId ? ` quotaId=${detail.quotaId}` : ""}`,
+      };
+    }
+    if (detail?.reason && DAILY_METRIC_PATTERN.test(detail.reason)) {
+      return { kind: "daily_quota_exhausted", evidence: `reason=${detail.reason}` };
+    }
+  }
+
+  // 2. Narrow, explicitly-per-day message patterns.
+  for (const pattern of DAILY_MESSAGE_PATTERNS) {
+    if (pattern.test(message)) {
+      return { kind: "daily_quota_exhausted", evidence: `message matches ${pattern}` };
+    }
+  }
+
+  // 3. A provider-supplied, sane retry delay.
+  const retryAfter = parseRetryAfter(retryAfterHeader);
+  const retryDelay = details.find((detail) => detail?.retryDelay)?.retryDelay;
+  const structuredDelay = retryDelay ? parseRetryDelay(retryDelay) : null;
+  const wait = retryAfter ?? structuredDelay;
+
+  if (wait !== null && wait > 0) {
+    return {
+      kind: "temporarily_throttled",
+      retryAfterSeconds: Math.min(wait, MAX_TRUSTED_RETRY_DELAY_SECONDS),
+      evidence: wait === retryAfter ? "Retry-After header" : "error.details.retryDelay",
+    };
+  }
+
+  // 4. Unclassifiable: transient, with a short bounded cooldown.
+  return {
+    kind: "temporarily_throttled",
+    retryAfterSeconds: DEFAULT_THROTTLE_COOLDOWN_SECONDS,
+    evidence: message ? "unclassified 429, defaulting to a short cooldown" : "unclassified 429",
+  };
+}
+
+/** Parses a `Retry-After` header in seconds; ignores dates and nonsense. */
+function parseRetryAfter(header: string | null): number | null {
+  if (!header) return null;
+  const seconds = Number.parseInt(header.trim(), 10);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
+/** Parses a protobuf duration such as `"37s"` or `"1.5s"`. */
+function parseRetryDelay(delay: string): number | null {
+  const match = /^(\d+(?:\.\d+)?)s$/.exec(delay.trim());
+  if (!match) return null;
+  const seconds = Number.parseFloat(match[1] ?? "");
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
 }
 
 /**
@@ -338,20 +493,32 @@ async function requestWithRetry(
     lastStatus = response.status;
 
     if (!isRetryableUpstreamStatus(response.status)) {
-      // Quota exhausted, bad key, disabled API or missing billing: surface that
-      // cause at once rather than retrying.
       if (response.status === 429) {
-        // A quota-exceeded 429 is permanent for the rest of the Pacific day, so
-        // it is distinguished from a throttled one: only the former should trip
-        // the shared circuit breaker.
-        if (isQuotaExceededDetail(detail)) {
+        const verdict = classifyRateLimit(payload, response.headers.get("retry-after"));
+
+        // Log the provider's own fields so a 429 is diagnosable later. Vercel
+        // retains only a short window of logs, and without this the next
+        // occurrence is just another anonymous 429.
+        console.warn("[notesnap] provider returned 429", {
+          provider: "gemini",
+          verdict: verdict.kind,
+          evidence: verdict.evidence,
+          ...(verdict.kind === "temporarily_throttled"
+            ? { retryAfterSeconds: verdict.retryAfterSeconds }
+            : {}),
+          details: (payload as ProviderErrorEnvelope | undefined)?.error?.details ?? [],
+          message: (payload as ProviderErrorEnvelope | undefined)?.error?.message ?? "",
+        });
+
+        if (verdict.kind === "daily_quota_exhausted") {
           throw new ProviderQuotaExceededError(detail, "gemini");
         }
-        throw new RetryableProviderError(
-          "The OCR provider is throttling this project; try again shortly.",
-          429,
-        );
+
+        // Transient: carry the provider's own wait through to the client so the
+        // message can tell the visitor when retrying is worthwhile.
+        throw new ThrottledProviderError(verdict.retryAfterSeconds, verdict.evidence);
       }
+      // Bad key, disabled API or missing billing: surface that cause at once.
       throw mapUpstreamError(response.status, detail);
     }
 

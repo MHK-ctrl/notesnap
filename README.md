@@ -245,18 +245,67 @@ instance shares one set of counters:
 is for NoteSnap to stop serving requests *before* Google starts refusing them, so
 visitors see "the demo is done for today" instead of an error.
 
+**There is no universally safe cap value.** Google's limits are per project *and*
+per model, differ between free and paid tiers, and change. Read your own number:
+
+- AI Studio → *Dashboard → Usage* (your project's real consumption)
+- <https://ai.google.dev/gemini-api/docs/rate-limits> (published tiers)
+- The API itself — a rejected response names the metric, e.g.
+  `quotaMetric: GenerateRequestsPerDay`. NoteSnap logs that field when it sees
+  one, so you can set the cap from evidence rather than a guess.
+
+Leave a margin (roughly 20–30% below your limit) so the demo closes cleanly
+before Google starts refusing requests, rather than mid-traffic.
+
+The default of 100 is an orientation value, not a recommendation: set it from
+your own project's number.
+
 **If Redis is unreachable the demo fails closed** with `503 demo_unavailable`.
 That is deliberate: quietly falling back to per-instance memory would let a
 Redis blip hand out unmetered requests and burn the project's quota invisibly.
 Point people at their own key instead. `GET /api/status` reports the same state
 the UI shows, with no secrets.
 
-### When the quota is genuinely gone
+### How provider failures are classified
 
-Once the provider confirms the daily quota is spent, NoteSnap records a circuit
-breaker in Redis and stops calling it, so later visitors are turned away
-immediately instead of each spending a request to rediscover the same wall. The
-flag is keyed by provider, model and Pacific date, and expires at the reset.
+A 429 is not automatically "the day is over". NoteSnap decides in a fixed order,
+most-trustworthy signal first:
+
+1. **Structured details** — a `quotaMetric` naming a per-day limit
+   (`GenerateRequestsPerDay`) is machine-readable evidence of daily exhaustion.
+2. **Narrow message patterns** — only phrases that explicitly say *per day*.
+3. **A valid `RetryInfo` / `Retry-After`** — the provider said when to come
+   back, so exactly that wait is used.
+4. **Otherwise: transient**, with a short shared cooldown.
+
+That last rule is the important one. An **ambiguous 429 never locks the app for
+a day** — it triggers a brief, shared cooldown (bounded, default 15s, hard cap
+2 minutes) during which every serverless instance backs off together. Being
+wrong in that direction costs seconds; being wrong the other way would take the
+demo down for a full day over a transient blip.
+
+Two breakers are tracked separately in Redis, and `/api/status` exposes the
+current one as `provider.state`:
+
+| `provider.state` | Meaning | `resetsAt` / `retryAfterSeconds` |
+| --- | --- | --- |
+| `ready` | No breaker, no throttle | — |
+| `daily_quota_exhausted` | Confirmed per-day quota rejection | `resetsAt` = next midnight Pacific |
+| `temporarily_throttled` | Short-lived rate limiting | `retryAfterSeconds` = wait to use |
+| `unknown` | No shared store, so state can't be read | — |
+
+`unknown` is deliberate: with no store the app cannot know, and claiming `ready`
+would be a claim it cannot support. The UI says "the demo can't confirm the
+provider's state" rather than implying everything is fine.
+
+### Accounting: reserve on attempt, refund on confirmed failure
+
+A demo request reserves budget before the provider call, and refunds it only when
+the provider **clearly refused** (invalid key, disabled API, daily quota spent).
+Ambiguous outcomes — timeouts, dropped connections, a 5xx after the bytes were
+sent — are **not** refunded, because the provider may still have counted them.
+Refunds use a single atomic decrement clamped at zero, so concurrent refunds
+cannot lose updates or drive a counter negative.
 
 ### Legitimate ways to add capacity
 
@@ -375,7 +424,8 @@ does.
 | Copy button says "Press Ctrl/Cmd + C" | Non-secure origin — the clipboard API is blocked | Serve over HTTPS (Vercel does this) or use `localhost`. |
 | `rate_limited` (429) | More than 10 transcriptions in a minute from one IP | Wait a minute, or raise `RATE_LIMIT_MAX`. |
 | `demo_budget_exhausted` (429) | The demo's shared daily budget is spent (per-IP or global) | Waits for midnight Pacific. Add your own key in the UI, self-host, or raise `DEMO_DAILY_MAX` **if** your provider limit allows it. |
-| `provider_quota_exhausted` (429) | Google's per-project daily quota for this key is spent | Wait for the Pacific reset, enable billing, or bring your own key. |
+| `provider_quota_exhausted` (429) | Google's per-project **daily** quota for this key is spent (confirmed via a per-day `quotaMetric` or an explicit per-day message) | Wait for the midnight-Pacific reset, enable billing, or bring your own key. |
+| `provider_busy` (429) | The provider is **temporarily** throttling — an ambiguous 429, or one carrying a `Retry-After` | Wait the `Retry-After` seconds and retry. Nothing is lost; this is not a daily limit. |
 | `demo_unavailable` (503) | The shared Upstash store is unreachable, so the demo can't track its budget | Check the Upstash database is active and both env vars are set for **Production**. The demo fails closed on purpose rather than serving unmetered requests. |
 | Quota errors (`429`, `ocr_failed`) | Gemini free-tier requests/day exhausted, or Cloud Vision rate limiting | Wait for the quota to reset (Gemini daily quotas reset at midnight US Pacific), raise your own limits, or upgrade the provider tier. |
 | `X-RateLimit-Mode: instance` in production | Upstash env vars are missing, so the limiter is per-instance only | Add `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN` (see [Shared rate limiting](#shared-rate-limiting-upstash-redis)) and redeploy. |

@@ -17,6 +17,13 @@
 
 "use client";
 
+/** Mirrors `ProviderState` in `lib/vision.ts`. */
+type ProviderState =
+  | "ready"
+  | "daily_quota_exhausted"
+  | "temporarily_throttled"
+  | "unknown";
+
 interface DemoStatusPanelProps {
   /** Remaining demo transcriptions today, or null when unknown. */
   remaining: number | null;
@@ -24,8 +31,10 @@ interface DemoStatusPanelProps {
   limit: number;
   /** True when the demo can serve a request right now. */
   available: boolean;
-  /** True when the provider's own daily quota is known to be spent. */
-  quotaExhausted: boolean;
+  /** What the OCR provider is currently doing. */
+  providerState: ProviderState;
+  /** Seconds to wait out a temporary throttle; 0 otherwise. */
+  retryAfterSeconds: number;
   /** Seconds until the daily budget refreshes. */
   resetsInSeconds: number;
   /** The visitor's own key. Memory only — never persisted. */
@@ -54,7 +63,8 @@ export default function DemoStatusPanel({
   remaining,
   limit,
   available,
-  quotaExhausted,
+  providerState,
+  retryAfterSeconds,
   resetsInSeconds,
   userKey,
   onUserKeyChange,
@@ -71,11 +81,25 @@ export default function DemoStatusPanel({
         Demo quota
       </h2>
 
-      {quotaExhausted ? (
+      {providerState === "daily_quota_exhausted" ? (
         <p className="text-slate-700">
-          The demo&rsquo;s free OCR quota is used up for today and resets in{" "}
-          <strong>{countdown}</strong> (midnight Pacific). Your photo is fine — the shared
-          demo just has no provider budget left. Add your own free key below to keep going.
+          <strong>Daily free quota used up.</strong> Google&rsquo;s per-day limit for this
+          demo&rsquo;s key is spent, so it resets in <strong>{countdown}</strong> (midnight
+          Pacific). Your photo is fine — there is just no provider budget left today. Add your
+          own free key below to keep going.
+        </p>
+      ) : providerState === "temporarily_throttled" ? (
+        <p className="text-slate-700">
+          <strong>The OCR provider is busy</strong> and rate limiting requests right now.
+          Retrying in about{" "}
+          <strong>{formatCountdown(retryAfterSeconds || resetsInSeconds)}</strong> should work —
+          this is a short pause, not a daily limit, so nothing is lost.
+        </p>
+      ) : providerState === "unknown" ? (
+        <p className="text-slate-700">
+          The demo can&rsquo;t confirm the provider&rsquo;s state right now, so it&rsquo;s pausing
+          new uploads rather than spending quota it can&rsquo;t track. Add your own free key
+          below to keep going.
         </p>
       ) : available ? (
         <p className="text-slate-700">

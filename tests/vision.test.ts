@@ -8,6 +8,7 @@ import {
   NoTextDetectedError,
   ProviderQuotaExceededError,
   RetryableProviderError,
+  ThrottledProviderError,
   VisionRequestError,
   transcribeImage,
 } from "@/lib/vision";
@@ -582,22 +583,32 @@ describe("transcribeImage — Gemini provider", () => {
     ).rejects.toBeInstanceOf(ApiNotEnabledError);
   });
 
-  it("maps a throttled 429 to a RetryableProviderError with status 429", async () => {
+  it("maps an ambiguous 429 to a short ThrottledProviderError, not a day lock", async () => {
     const { fetchImpl } = stubFetch(() =>
-      jsonResponse({ error: { code: 429, message: "Rate limit exceeded for this model." } }, 429),
+      jsonResponse({ error: { code: 429, message: "Rate limit exceeded." } }, 429),
     );
 
     const error = await transcribeImage(IMAGE, { provider: "gemini", apiKey: "k", fetchImpl }).catch(
       (e: unknown) => e,
     );
-    expect(error).toBeInstanceOf(RetryableProviderError);
-    expect((error as RetryableProviderError).status).toBe(429);
+
+    expect(error).toBeInstanceOf(ThrottledProviderError);
+    expect((error as ThrottledProviderError).retryAfterSeconds).toBeGreaterThan(0);
+    expect((error as ThrottledProviderError).retryAfterSeconds).toBeLessThanOrEqual(120);
   });
 
-  it("treats a confirmed quota_exceeded 429 as a whole-day condition", async () => {
+  it("uses a structured per-day quotaMetric as day-long evidence", async () => {
     const { fetchImpl } = stubFetch(() =>
       jsonResponse(
-        { error: { code: 429, message: "Quota exceeded for quota metric: Generate requests" } },
+        {
+          error: {
+            code: 429,
+            message: "Resource exhausted.",
+            details: [
+              { "@type": "QuotaFailure", quotaMetric: "GenerateRequestsPerDay", quotaId: "abc" },
+            ],
+          },
+        },
         429,
       ),
     );
@@ -606,16 +617,18 @@ describe("transcribeImage — Gemini provider", () => {
       (e: unknown) => e,
     );
 
-    // Distinct from throttling: this one lasts until the Pacific reset, so the
-    // route records a circuit breaker rather than inviting an immediate retry.
     expect(error).toBeInstanceOf(ProviderQuotaExceededError);
-    expect((error as ProviderQuotaExceededError).provider).toBe("gemini");
   });
 
-  it("does not retry a 429 — the quota is spent, not shedding load", async () => {
-    const { fetchImpl, calls } = stubFetch(() =>
+  it("treats an explicit per-day message as day-long evidence", async () => {
+    const { fetchImpl } = stubFetch(() =>
       jsonResponse(
-        { error: { code: 429, message: "Quota exceeded for quota metric: Generate requests" } },
+        {
+          error: {
+            code: 429,
+            message: "Quota exceeded for quota metric: GenerateRequestsPerDay",
+          },
+        },
         429,
       ),
     );
@@ -623,29 +636,47 @@ describe("transcribeImage — Gemini provider", () => {
     await expect(
       transcribeImage(IMAGE, { provider: "gemini", apiKey: "k", fetchImpl }),
     ).rejects.toBeInstanceOf(ProviderQuotaExceededError);
+  });
+
+  it("does not retry a daily-quota 429", async () => {
+    const { fetchImpl, calls } = stubFetch(() =>
+      jsonResponse(
+        { error: { code: 429, message: "You exceeded your current quota, please check your plan and billing details." } },
+        429,
+      ),
+    );
+
+    await expect(
+      transcribeImage(IMAGE, { provider: "gemini", apiKey: "k", fetchImpl }),
+    ).rejects.toBeInstanceOf(ThrottledProviderError);
     expect(calls).toHaveLength(1);
   });
 
-  it("treats RESOURCE_EXHAUSTED as quota exhaustion", async () => {
+  it("honours the provider's own Retry-After as a transient wait", async () => {
+    const { fetchImpl } = stubFetch(() =>
+      new Response(JSON.stringify({ error: { code: 429, message: "Slow down." } }), {
+        status: 429,
+        headers: { "content-type": "application/json", "retry-after": "42" },
+      }),
+    );
+
+    const error = await transcribeImage(IMAGE, { provider: "gemini", apiKey: "k", fetchImpl }).catch(
+      (e: unknown) => e,
+    );
+
+    expect(error).toBeInstanceOf(ThrottledProviderError);
+    expect((error as ThrottledProviderError).retryAfterSeconds).toBe(42);
+  });
+
+  it("never turns a bare RESOURCE_EXHAUSTED into a day-long lock", async () => {
+    // Google's wording alone is ambiguous, so this must stay transient.
     const { fetchImpl } = stubFetch(() =>
       jsonResponse({ error: { code: 429, message: "RESOURCE_EXHAUSTED" } }, 429),
     );
 
     await expect(
       transcribeImage(IMAGE, { provider: "gemini", apiKey: "k", fetchImpl }),
-    ).rejects.toBeInstanceOf(ProviderQuotaExceededError);
-  });
-
-  it("keeps an unclassifiable 429 on the retryable path", async () => {
-    // Guessing "exhausted" here would close the demo for the whole day on a
-    // transient error, so ambiguity resolves to the safer option.
-    const { fetchImpl } = stubFetch(() =>
-      jsonResponse({ error: { code: 429, message: "Too many requests." } }, 429),
-    );
-
-    await expect(
-      transcribeImage(IMAGE, { provider: "gemini", apiKey: "k", fetchImpl }),
-    ).rejects.toBeInstanceOf(RetryableProviderError);
+    ).rejects.toBeInstanceOf(ThrottledProviderError);
   });
 
   it("retries a 503 and succeeds when the provider recovers", async () => {
