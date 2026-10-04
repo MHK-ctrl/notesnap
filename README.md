@@ -84,7 +84,8 @@ of a real snap → text run is the next upgrade here.</sub>
 - Your image is sent to Google (the Gemini API or Cloud Vision, depending on which key is configured) for processing, then discarded. **NoteSnap does not store your photos or your text** — no database, no blob storage, no upload log.
 - The preview and the OCR result live only in your browser tab's memory. Closing the tab loses both.
 - Nothing is written to disk on the server; the image is held in memory for the duration of one request.
-- The only third party involved is Google, under [Google Cloud's terms](https://cloud.google.com/terms) and — for Gemini's free tier — [the Gemini API terms](https://ai.google.dev/gemini-api/terms), where Google may use submitted content to improve its products. If that matters to you, use Cloud Vision or a different engine in `lib/vision.ts`.
+- The only third party involved is Google, under [Google Cloud's terms](https://cloud.google.com/terms) and — for Gemini — [the Gemini API terms](https://ai.google.dev/gemini-api/terms).
+- **Gemini free tier: read this before you scan anything sensitive.** Every request is sent with `store: false`, so Google does not retain the Interaction server-side after the response. That is the opposite of the usual "saved to your activity" default, but it is **not** the same as "never used": Google's published data-handling terms say content submitted on the Gemini API **free tier may be used to improve Google's products** (the paid tier is the tier that opts out). For medical, legal, financial or otherwise confidential notes, use Cloud Vision with billing — or a paid Gemini tier — or swap in another engine in `lib/vision.ts`.
 
 ## Quick start (local)
 
@@ -120,14 +121,24 @@ Two minutes:
 4. **Restart the dev server** — the key is read per request, but Next.js only loads `.env.local` at startup.
 
 By default the adapter calls a current Flash model (`gemini-3.8-flash` at the
-time of writing); set `GEMINI_MODEL` to use a different one. Smaller models work,
-but they read messy handwriting less reliably.
+time of writing). Override it with `GEMINI_MODEL` if that model isn't in your
+project's free tier or you want a different trade-off:
 
-Free-tier limits (requests per minute and per day, per project) live at
-<https://ai.google.dev/gemini-api/docs/rate-limits> and in AI Studio under
-*Dashboard → Usage*. NoteSnap's own limiter (10/minute per IP) usually bites
-first. On the free tier Google may use submitted content to improve its
-products — see [Privacy](#privacy).
+```bash
+GEMINI_MODEL=gemini-3.5-flash-lite    # cheaper/faster, weaker on messy handwriting
+```
+
+Smaller models work, but they read messy handwriting less reliably — if results
+get worse, try a larger Flash model before suspecting your photos.
+
+**Free-tier limits are per project**, not per key: requests per minute, tokens
+per minute and requests per day, varying by model. **Requests per day reset at
+midnight US Pacific.** See the live numbers at
+<https://ai.google.dev/gemini-api/docs/rate-limits>, and your own project's
+actual usage in AI Studio under *Dashboard → Usage*. Every key you create in the
+same project draws on the same quota. NoteSnap's own limiter (10/minute per IP)
+usually bites first. On the free tier Google may use submitted content to
+improve its products — see [Privacy](#privacy).
 
 ## Alternative: Google Cloud Vision key
 
@@ -191,7 +202,7 @@ vercel --prod
 | --- | --- | --- |
 | `GEMINI_API_KEY` | **Yes** | Free-tier Gemini key from Google AI Studio. Server-side only — never prefix it with `NEXT_PUBLIC_`. |
 | `GOOGLE_VISION_API_KEY` | **Yes** | Cloud Vision key. Wins over `GEMINI_API_KEY` when both are set. |
-| `GEMINI_MODEL` | No | Gemini model override (default: a current Flash model). |
+| `GEMINI_MODEL` | No | Gemini model override, e.g. `gemini-3.5-flash-lite` (default: a current Flash model, `gemini-3.8-flash` at the time of writing). |
 | `UPSTASH_REDIS_REST_URL` | Recommended | Shared rate-limit store. Without it, limiting is per-instance only. |
 | `UPSTASH_REDIS_REST_TOKEN` | Recommended | REST token paired with that URL. |
 | `RATE_LIMIT_MAX` | No | Requests allowed per client per window (default `10`). |
