@@ -19,16 +19,19 @@ interface TranscribeResponse {
   error?: { code?: string; message?: string };
 }
 
-/** Shape of `GET /api/status`. */
+/** Shape of `GET /api/status`. Mirrors `app/api/status/route.ts` exactly. */
 interface DemoStatus {
   demo: {
     available: boolean;
     used: number | null;
     limit: number;
     remaining: number | null;
-    resetsInSeconds: number;
+    resetsAt: string;
+    perIpDailyLimit: number;
   };
-  quota: { exhausted: boolean };
+  quota: { exhausted: boolean; resetsAt: string };
+  /** Note: top-level, not nested under `demo`. */
+  resetsInSeconds: number;
 }
 
 const UNKNOWN_STATUS: DemoStatus = {
@@ -37,9 +40,11 @@ const UNKNOWN_STATUS: DemoStatus = {
     used: null,
     limit: 0,
     remaining: null,
-    resetsInSeconds: 0,
+    resetsAt: "",
+    perIpDailyLimit: 0,
   },
-  quota: { exhausted: false },
+  quota: { exhausted: false, resetsAt: "" },
+  resetsInSeconds: 0,
 };
 
 export default function HomePage() {
@@ -215,7 +220,7 @@ export default function HomePage() {
         limit={demoStatus.demo.limit}
         available={demoStatus.demo.available}
         quotaExhausted={demoStatus.quota.exhausted}
-        resetsInSeconds={demoStatus.demo.resetsInSeconds}
+        resetsInSeconds={demoStatus.resetsInSeconds}
         userKey={userKey}
         onUserKeyChange={setUserKey}
       />

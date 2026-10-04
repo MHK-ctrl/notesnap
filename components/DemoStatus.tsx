@@ -33,8 +33,15 @@ interface DemoStatusPanelProps {
   onUserKeyChange: (value: string) => void;
 }
 
+/**
+ * Formats the wait until the daily budget refreshes.
+ *
+ * An unknown or already-elapsed value reports "soon" rather than inventing a
+ * duration: on the reset boundary the true wait is under a minute, and guessing
+ * "0m" would read as a bug.
+ */
 function formatCountdown(totalSeconds: number): string {
-  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return "shortly";
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return "soon";
 
   const hours = Math.floor(totalSeconds / 3600);
   const minutes = Math.floor((totalSeconds % 3600) / 60);
