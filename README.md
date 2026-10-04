@@ -105,7 +105,9 @@ Requirements: **Node.js 20 or newer** and npm.
 Vision's REST API accepts an API key, so there is no SDK and no service-account
 JSON to manage. About five minutes:
 
-1. **Create a project** — <https://console.cloud.google.com/projectcreate>. Name it anything (e.g. `notesnap-dev`).
+1. **Create a project** — <https://console.cloud.google.com/projectcreate>. This project is **yours**: NoteSnap ships no Google Cloud resources, there is no shared "notesnap" project to join, and the name is arbitrary (`notesnap-dev` is a fine choice).
+
+   Then find your **Project ID** — it's the small grey ID next to the project's name in the picker (<https://console.cloud.google.com/projectselector2/home/dashboard>), something like `notesnap-dev-482113`. Every console link below accepts `?project=<that-ID>`, and it's what you'd hand to a helper. The project ID is not a secret; the API key is.
 2. **Enable the Cloud Vision API** — <https://console.cloud.google.com/apis/library/vision.googleapis.com>, select your project, click **Enable**. (OCR requests fail with `403` until this is done.)
 3. **Make sure billing is on** — <https://console.cloud.google.com/billing>. Vision has a free monthly tier, but Google requires a billing account on the project. See [Cost & limits](#cost--limits).
 4. **Create the key** — <https://console.cloud.google.com/apis/credentials> → **Create credentials** → **API key**.
